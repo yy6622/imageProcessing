@@ -1,0 +1,3 @@
+pip install seaborn
+python colorDetection_Train.py --compare
+python colorDetect.py --image dataset/example.jpg
