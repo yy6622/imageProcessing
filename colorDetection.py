@@ -34,7 +34,7 @@ separating touching fruit without an object detector — that code has
 been removed (not just disconnected) per an explicit decision to drop
 SVM entirely from this project. It's still recoverable from earlier
 version history if a report needs to reference/compare against it;
-colorDetection_Train.py's training functions for it are unaffected by
+segmentation.py's training functions for it are unaffected by
 this file's changes.
 
 Typical use (single image, full pipeline):
@@ -53,7 +53,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from colorDetection_Train import segmentation_mask_and_contour
+from segmentation import segmentation_mask_and_contour
 
 import preprocessing as prep
 from calibration import CalibrationResult, uncalibrated
@@ -302,7 +302,7 @@ def inspect_image_yolo(
 
     Each YOLO box is re-segmented locally (segmentation_mask_and_
     contour — LAB chroma-distance segmentation, imported from
-    colorDetection_Train.py) within just that box's crop, to get a
+    segmentation.py) within just that box's crop, to get a
     real contour/mask for measurements and for "crop_isolated" — the
     box alone is just a rectangle, it doesn't say which pixels inside
     it are this fruit vs. a sliver of its neighbor.

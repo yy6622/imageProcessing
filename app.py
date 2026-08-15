@@ -35,7 +35,7 @@ accuracy vs. the CNN's ~98%; YOLO recovers meaningfully more instances
 than the classical splitter on densely packed/overlapping fruit. There
 is no SVM fallback anymore — if ultralytics or a trained CNN model
 isn't available, this app says so plainly rather than silently
-degrading. colorDetection_Train.py has since been trimmed the same
+degrading. segmentation.py has since been trimmed the same
 way: its SVM/RandomForest/KNN training functions, the classical
 multi-fruit watershed/Hough splitter, and every hand-engineered
 feature extractor were all deleted outright (unused code, not kept
@@ -182,7 +182,7 @@ def get_calibration(image):
 # ======================================================
 # Main — image ingestion
 # ======================================================
-st.title("🍎 Fruit Quality Inspection Dashboard")
+st.title("Fruit Quality Inspection Dashboard")
 st.caption("Detects every fruit in each photo, classifies its type and quality, and reports the results.")
 
 images_to_process = []  # list of (name, bgr_image)

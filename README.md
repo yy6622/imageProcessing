@@ -26,7 +26,7 @@ detection/splitting code and every hand-engineered shape/color-
 histogram/color-moment/texture feature extractor, has since been
 removed from the codebase on request ("no unused code"), not just
 disconnected from the live pipeline. The ONE exception:
-`segmentation_mask_and_contour()` in `colorDetection_Train.py`,
+`segmentation_mask_and_contour()` in `segmentation.py`,
 because it's a genuine live dependency — `colorDetection.py` still
 calls it for local re-segmentation within each YOLO box. The "Known
 limitations" and "Notes / design decisions" sections below still
@@ -38,7 +38,7 @@ each entry's note on whether it still applies to the live pipeline.
 
 | File | Assignment requirement it satisfies |
 |---|---|
-| `colorDetection_Train.py` | Down to just LAB chroma-distance background segmentation (`segmentation_mask_and_contour()`) — the one piece of the original classical pipeline still actually called by anything (`colorDetection.py` imports it for local re-segmentation within each YOLO box). Everything else that used to live here — SVM/RandomForest/KNN classifier training, the distance-transform + Hough-assisted watershed splitter for touching fruit, and every hand-engineered feature extractor (shape/color-histogram/color-moment/LBP-texture) — has been deleted outright, per an explicit "no unused code" decision, not just disconnected. See this file's module docstring. |
+| `segmentation.py` | Down to just LAB chroma-distance background segmentation (`segmentation_mask_and_contour()`) — the one piece of the original classical pipeline still actually called by anything (`colorDetection.py` imports it for local re-segmentation within each YOLO box). Everything else that used to live here — SVM/RandomForest/KNN classifier training, the distance-transform + Hough-assisted watershed splitter for touching fruit, and every hand-engineered feature extractor (shape/color-histogram/color-moment/LBP-texture) — has been deleted outright, per an explicit "no unused code" decision, not just disconnected. See this file's module docstring. |
 | `train_cnn_quality.py` | Trains the CNN quality classifier (MobileNetV2 transfer learning, one model per fruit type) that `app.py` actually uses for Fresh/Unripe/Rotten — see the "CNN quality classification" section below for the full story (including a data-leakage bug found and fixed along the way). |
 | `preprocessing.py` | **Preprocessing** — Gaussian / median / bilateral denoising, plus contrast stretching / CLAHE / histogram equalization for enhancement. |
 | `calibration.py` | **Image Calibration** — spatial scaling from pixels to cm, either automatically via an ArUco marker placed in the photo, or manually via a known cm-per-pixel ratio. Also includes 4-point perspective rectification. |
@@ -134,7 +134,7 @@ download the results as CSV or as a formatted PDF report.
 
 - **Non-plain / textured backgrounds (wood tables, patterned surfaces)
   are not reliably supported yet.** Segmentation (`_foreground_contours`
-  in `colorDetection_Train.py`) estimates ONE background color by
+  in `segmentation.py`) estimates ONE background color by
   sampling a thin strip along the image border, then thresholds by LAB
   chroma distance from it. That assumes a plain, roughly uniform
   background — a wood table's grain lines/knots/shadows between planks
@@ -304,7 +304,7 @@ download the results as CSV or as a formatted PDF report.
   multi-fruit-detection helper — not just stop calling them.
   `ClassificationResult` was also simplified (dropped `fruit_type_votes`/
   `vote_counts`/`n_patches`, which only ever meant anything for the SVM
-  patch-vote path). `colorDetection_Train.py` got the same treatment for
+  patch-vote path). `segmentation.py` got the same treatment for
   its half of the SVM code: `build_model()`/`train_model()`/
   `train_hierarchical_model()`/`compare_models()`, `VotingEnsemble`,
   `evaluate_majority_vote()`, and every `save_*`/`load_*` model
@@ -351,7 +351,7 @@ download the results as CSV or as a formatted PDF report.
   learn a blurred, self-contradictory color->ripeness mapping (the same
   yellow color would need to mean two different things). Fixed by
   training two stages (`train_hierarchical_model()` in
-  `colorDetection_Train.py`): stage 1 classifies fruit type from every
+  `segmentation.py`): stage 1 classifies fruit type from every
   patch regardless of species; stage 2 is a *separate* quality
   classifier per fruit type, so "yellow" is only ever interpreted using
   the color->ripeness mapping learned from that species' own training
@@ -366,7 +366,7 @@ download the results as CSV or as a formatted PDF report.
   Unripe/Rotten stages (e.g. two species that are both green-when-
   unripe, or both brown/black-when-rotten) — color alone can't reliably
   tell them apart there. `extract_shape_features()` in
-  `colorDetection_Train.py` computes a 4-number whole-object descriptor
+  `segmentation.py` computes a 4-number whole-object descriptor
   once per image from its detected contour — bounding-box aspect ratio,
   extent, solidity, and ellipse elongation — and appends it to every
   patch's color feature ONLY for the fruit-type stage (the quality
@@ -387,7 +387,7 @@ download the results as CSV or as a formatted PDF report.
   the color histogram stops separating them — confirmed directly on a
   real photo, where two normally-lit, unoccluded apples split ~50/50
   Apple/Orange despite looking nothing alike to a person.
-  `extract_texture_histogram()` in `colorDetection_Train.py` adds a
+  `extract_texture_histogram()` in `segmentation.py` adds a
   16-bin Local Binary Pattern (LBP) histogram to every patch's color
   feature (521-dim -> 537-dim) — LBP encodes, per pixel, whether each
   of its 8 neighbors is brighter or darker than it, a lighting-
@@ -414,7 +414,7 @@ download the results as CSV or as a formatted PDF report.
   same mechanism that correctly finds a second, physically separate
   fruit elsewhere in the photo. A leaf's flat, curved, veined shape
   then reads as elongated enough to get shape-classified as Banana.
-  `_looks_like_fruit()` in `colorDetection_Train.py` rejects any
+  `_looks_like_fruit()` in `segmentation.py` rejects any
   detected object whose outline fills under 40% of its bounding box
   AND falls well below a round fruit's convexity AT THE SAME TIME —
   confirmed on a real apple-with-leaf photo that a leaf fails both at
@@ -431,7 +431,7 @@ download the results as CSV or as a formatted PDF report.
   touching/overlapping cluster just because it's the smallest.
 - **Preprocessing must match between training and inference.** This
   classifier's features are pure color histograms/moments, so denoise/
-  enhance settings change what it sees. `colorDetection_Train.py`
+  enhance settings change what it sees. `segmentation.py`
   applies `preprocessing.preprocess_image()` to every training image
   before segmenting it (`--denoise`/`--enhance` flags, defaults
   `median`/`clahe`), and saves those settings inside the `.pkl` file.
@@ -452,7 +452,7 @@ download the results as CSV or as a formatted PDF report.
   silently drops any fruit that isn't part of the single largest
   connected region (a second apple sitting elsewhere in the same
   photo, not touching anything, would just vanish). `find_object_instances()`
-  in `colorDetection_Train.py` fixes both: it looks at every foreground
+  in `segmentation.py` fixes both: it looks at every foreground
   contour above the noise-size threshold (not just the largest), and
   for each one, `_split_touching_cluster()` decides whether it's one
   fruit or several fused together —
@@ -508,7 +508,7 @@ download the results as CSV or as a formatted PDF report.
   leak into the mask and get fed to the classifier as if they were
   fruit pixels. Tunable via `SEGMENTATION_CHROMA_THRESHOLD` (raise if
   background still isn't fully excluded; lower if pale fruit is being
-  cut out) and `SEGMENTATION_BORDER_FRAC` in `colorDetection_Train.py`.
+  cut out) and `SEGMENTATION_BORDER_FRAC` in `segmentation.py`.
   `colorDetection.py`'s `build_foreground_mask()` mirrors this exact
   logic so the bounding box/contour shown in the dashboard always
   matches the region actually fed to the classifier.

@@ -45,7 +45,7 @@ USAGE
 
 This trains one small model per fruit type found in CLASS_FOLDERS
 (Apple / Banana / Orange by default — edit CLASS_FOLDERS below if your
-folder names differ, same convention as colorDetection_Train.py) and
+folder names differ, same convention as segmentation.py) and
 saves each as cnn_quality_models/<FruitType>.pt.
 
 To classify a single already-cropped/segmented fruit image with a
@@ -72,7 +72,7 @@ import os
 import random
 import re
 
-# Mirrors colorDetection_Train.CLASS_FOLDERS — edit if your dataset
+# Mirrors segmentation.CLASS_FOLDERS — edit if your dataset
 # folder names differ. Reusing the same convention keeps this script
 # drop-in compatible with the dataset you already have.
 CLASS_FOLDERS = {

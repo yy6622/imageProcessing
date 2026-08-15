@@ -1,3 +1,3 @@
 pip install seaborn
-python colorDetection_Train.py --compare
-python colorDetect.py --image dataset/example.jpg
+python train_cnn_quality.py --dataset dataset/train
+streamlit run app.py

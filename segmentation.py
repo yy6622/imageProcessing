@@ -1,5 +1,5 @@
 """
-colorDetection_Train.py
+segmentation.py
 ==============================================
 LAB chroma-distance background segmentation — the one piece of this
 project's original classical-CV pipeline that's still an active,
