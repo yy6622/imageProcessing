@@ -1,48 +1,4 @@
 """
-app.py
-==============================================
-Streamlit dashboard for the fruit quality inspection system.
-
-Ties together every other module into one GUI:
-    - preprocessing.py   (noise removal + enhancement)
-    - calibration.py     (pixel -> physical unit scaling)
-    - colorDetection.py  (YOLO detection/fruit-type + CNN quality classification)
-    - report.py          (PDF export)
-
-Satisfies:
-    - "Data Analysis Dashboard: An interface to summarise object
-      properties and inspection/enhancement results."
-    - (Extra effort) "GUI: Support for bulk image ingestion, such as
-      folder-based uploads or multi-image selection."
-    - (Extra effort) "Reporting: Automated export ... into PDF format."
-      (wired to report.generate_report via a download button)
-
-ARCHITECTURE NOTE (as of this version): the original SVM-based pipeline
-(patch+majority-vote classifiers for both fruit TYPE and QUALITY,
-classical distance-transform/Hough/watershed detection) has been
-removed entirely, per an explicit decision to drop SVM from this
-project — not just disconnected from this app, but deleted from
-colorDetection.py (inspect_image(), classify_fruit_type(),
-classify_segmented_image(), classify_segmented_image_known_type(),
-detect_objects(), and friends are all gone from that file now). This
-app now runs YOLOv8 (pretrained on COCO — apple/banana/orange are
-already 3 of its 80 classes, zero extra training needed) for detection
-+ fruit type, and a CNN (train_cnn_quality.py, one MobileNetV2 model
-per fruit type) for quality — an explicit choice, not a default: the
-SVM quality path had a confirmed structural blind spot (patch-vote
-majority washes out small localized decay) and measured ~73% held-out
-accuracy vs. the CNN's ~98%; YOLO recovers meaningfully more instances
-than the classical splitter on densely packed/overlapping fruit. There
-is no SVM fallback anymore — if ultralytics or a trained CNN model
-isn't available, this app says so plainly rather than silently
-degrading. segmentation.py has since been trimmed the same
-way: its SVM/RandomForest/KNN training functions, the classical
-multi-fruit watershed/Hough splitter, and every hand-engineered
-feature extractor were all deleted outright (unused code, not kept
-"just in case") — see that file's module docstring. All that's left
-there is segmentation_mask_and_contour(), which colorDetection.py
-still imports for local re-segmentation within each YOLO box.
-
 Run with:
     streamlit run app.py
 """
@@ -113,6 +69,39 @@ def summary_to_text(summary):
 # Sidebar — minimal configuration
 # ======================================================
 st.sidebar.title("Inspection Settings")
+
+# Methodology-section selector — matches the report's 2.1.x technique
+# breakdown (each teammate owns one section). Only 2.1.1 Colour Feature
+# Extraction is wired up in this module (LAB chroma-distance
+# segmentation + YOLO + CNN, below); the other sections belong to
+# teammates' modules and aren't implemented here yet. Selecting one of
+# them does NOT change what actually runs — the pipeline below always
+# executes the same Colour Feature Extraction path regardless of this
+# choice. This is a label/display selector, not a functional switch.
+IMPLEMENTED_TECHNIQUE = "Colour Feature Extraction"
+TECHNIQUE_OPTIONS = [
+    IMPLEMENTED_TECHNIQUE,
+    "Morphological and Texture Feature Extraction",
+    "Defect Detection",
+    "Stem Detection",
+    "All of the above",
+]
+selected_technique = st.sidebar.selectbox(
+    "Technique / method (report section)",
+    TECHNIQUE_OPTIONS,
+    index=0,
+    help="Matches the report's methodology sections. Only Colour Feature "
+         "Extraction is implemented in this app (LAB chroma-distance "
+         "segmentation + YOLO + CNN) — the others are placeholders for "
+         "teammates' modules and don't change what actually runs below.",
+)
+if selected_technique != IMPLEMENTED_TECHNIQUE:
+    st.sidebar.caption(
+        f"ℹ️ “{selected_technique}” isn't implemented in this module yet — "
+        f"running the same {IMPLEMENTED_TECHNIQUE} pipeline (LAB + YOLO + CNN) below."
+    )
+
+st.sidebar.divider()
 
 # Detection + fruit TYPE: YOLOv8 only — no classical/SVM fallback.
 # Quality: CNN only — no SVM fallback either. Both stay silent in the
