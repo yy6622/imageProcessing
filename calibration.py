@@ -1,4 +1,29 @@
+"""
+calibration.py
+==============================================
+Spatial calibration: converts pixel measurements into physical units
+(cm / cm^2) so bounding boxes and areas reported by the dashboard mean
+something in the real world, not just "pixels".
 
+Satisfies the assignment requirement:
+    "Image Calibration: Perform spatial scaling and rectification to
+     maintain consistency between pixel dimensions and physical
+     measurements."
+
+Two ways to supply the pixel->cm scale (both MANUAL, no ArUco/marker
+detection — that mode was removed since nothing used it):
+    - manual_scale(cm_per_pixel): you already know the ratio.
+    - manual_reference(reference_width_cm, reference_width_px): you
+      know a reference object's real width and its width in the photo
+      (in pixels) instead, and this derives the ratio from that.
+
+Also provides `rectify_perspective` (+ its `order_points` helper): if
+the camera isn't perfectly perpendicular to the inspection surface, a
+4-point perspective warp straightens the image plane first so pixel
+spacing is uniform across the frame before measurement. The 4 corners
+can come from `detect_reference_quad()` (auto: largest 4-sided shape
+found in the photo) or be entered manually as a fallback.
+"""
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -6,62 +31,19 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-DEFAULT_MARKER_SIZE_CM = 5.0
-
-DEFAULT_ARUCO_DICT = cv2.aruco.DICT_4X4_50 if hasattr(cv2, "aruco") else None
-
 
 @dataclass
 class CalibrationResult:
     cm_per_pixel: float
-    method: str                   
+    method: str                       # "manual" | "none"
     marker_corners: Optional[np.ndarray] = None
-    confidence: str = "ok"     
+    confidence: str = "ok"            # "ok" | "fallback" | "uncalibrated"
 
     def px_to_cm(self, pixels):
         return pixels * self.cm_per_pixel
 
     def px_area_to_cm2(self, pixels_area):
         return pixels_area * (self.cm_per_pixel ** 2)
-
-
-def detect_aruco_scale(image, marker_size_cm=DEFAULT_MARKER_SIZE_CM, aruco_dict=DEFAULT_ARUCO_DICT):
-
-    if not hasattr(cv2, "aruco"):
-        return None
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    try:
-        dictionary = cv2.aruco.getPredefinedDictionary(aruco_dict)
-        parameters = cv2.aruco.DetectorParameters()
-        detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-        corners, ids, _ = detector.detectMarkers(gray)
-    except AttributeError:
-        dictionary = cv2.aruco.Dictionary_get(aruco_dict)
-        parameters = cv2.aruco.DetectorParameters_create()
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=parameters)
-
-    if ids is None or len(corners) == 0:
-        return None
-    marker_corners = corners[0].reshape((4, 2))
-    side_lengths_px = [
-        np.linalg.norm(marker_corners[i] - marker_corners[(i + 1) % 4])
-        for i in range(4)
-    ]
-    avg_side_px = float(np.mean(side_lengths_px))
-
-    if avg_side_px < 1e-6:
-        return None
-
-    cm_per_pixel = marker_size_cm / avg_side_px
-
-    return CalibrationResult(
-        cm_per_pixel=cm_per_pixel,
-        method="aruco",
-        marker_corners=marker_corners,
-        confidence="ok",
-    )
 
 
 def manual_scale(cm_per_pixel: float) -> CalibrationResult:
@@ -84,29 +66,74 @@ def manual_reference(reference_width_cm: float, reference_width_px: float) -> Ca
 
 
 def uncalibrated() -> CalibrationResult:
-
+    """
+    No calibration available — measurements will be reported in pixels
+    only. cm_per_pixel=1.0 acts as an identity scale so downstream code
+    doesn't need special-casing; `confidence` flags it as untrustworthy
+    for physical units.
+    """
     return CalibrationResult(cm_per_pixel=1.0, method="none", confidence="uncalibrated")
-
-
-def calibrate(image, marker_size_cm=DEFAULT_MARKER_SIZE_CM, manual_cm_per_pixel: Optional[float] = None):
-
-    result = detect_aruco_scale(image, marker_size_cm=marker_size_cm)
-    if result is not None:
-        return result
-
-    if manual_cm_per_pixel is not None:
-        r = manual_scale(manual_cm_per_pixel)
-        r.confidence = "fallback"
-        return r
-
-    return uncalibrated()
 
 
 # ======================================================
 # Perspective rectification
 # ======================================================
-def rectify_perspective(image, src_points: np.ndarray, output_size: Tuple[int, int] = None):
+def detect_reference_quad(image, min_area_frac: float = 0.05):
+    """
+    Attempts to automatically find the largest 4-sided (quadrilateral)
+    contour in the image, to use as a rectify_perspective() reference
+    (e.g. a card, tray, or table edge). Returns a (4, 2) float32 array
+    of corner points, or None if nothing suitable was found.
 
+    Less reliable than a coded marker (ArUco): there's no unique
+    identity to lock onto, so this just picks the largest sufficiently
+    rectangular shape it sees — it can pick the wrong object if the
+    frame is cluttered, low-contrast, or the intended reference isn't
+    the most prominent quadrilateral in view. Callers should treat a
+    None return as "fall back to manual corner entry", not an error.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    image_area = image.shape[0] * image.shape[1]
+    min_area = min_area_frac * image_area
+
+    best_quad = None
+    best_area = 0.0
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+        area = cv2.contourArea(approx)
+        if area < min_area or area <= best_area:
+            continue
+        best_area = area
+        best_quad = approx.reshape(4, 2).astype(np.float32)
+
+    return best_quad
+
+
+def rectify_perspective(image, src_points: np.ndarray, output_size: Tuple[int, int] = None):
+    """
+    Warps the quadrilateral defined by src_points (4 corner points, any
+    order, in the *original* image) onto a straight-on rectangle, so
+    that pixel spacing is uniform across the whole frame. Use this when
+    the camera isn't mounted perfectly perpendicular to the inspection
+    surface (a common source of measurement error: objects farther
+    from the camera look smaller than they are).
+
+    src_points: array of shape (4, 2) — e.g. the 4 corners of a
+    reference card/marker, or a manually annotated region of interest.
+    output_size: (width, height) of the rectified output. If None,
+    it's estimated from the max side lengths of src_points.
+    """
     pts = order_points(src_points)
     (tl, tr, br, bl) = pts
 

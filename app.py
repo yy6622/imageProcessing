@@ -41,7 +41,14 @@ st.set_page_config(page_title="Fruit Quality Inspection Dashboard", layout="wide
 # Exposed only inside the "Advanced settings" expander below.
 DEFAULT_ERODE_PIXELS = 10
 DEFAULT_YOLO_CONFIDENCE = 0.25
-DEFAULT_MARKER_SIZE_CM = 5.0
+
+# Denoise/enhance are fixed rather than user-selectable — median +
+# CLAHE cover the two jobs (salt-and-pepper noise removal, local
+# contrast boost) well enough for this pipeline that exposing every
+# alternative in the sidebar just added clutter without a real
+# use case for switching them at inspection time.
+DENOISE_METHOD = "median"
+ENHANCE_METHOD = "clahe"
 
 
 # ======================================================
@@ -129,31 +136,66 @@ if not CNN_AVAILABLE:
 
 st.sidebar.divider()
 want_measurements = st.sidebar.checkbox("Measure physical size (cm)", value=False)
-marker_size_cm = DEFAULT_MARKER_SIZE_CM
 manual_cm_per_pixel = None
-calib_mode = "None (pixels only)"
+ref_width_cm = None
+ref_width_px = None
+scale_mode = "I know my cm-per-pixel ratio"
 if want_measurements:
-    calib_mode = st.sidebar.radio(
+    scale_mode = st.sidebar.radio(
         "How is scale determined?",
-        ["Auto-detect ArUco marker in photo", "I know my cm-per-pixel ratio"],
+        ["I know my cm-per-pixel ratio", "I know a reference object's width (cm + px)"],
     )
-    if calib_mode.startswith("Auto"):
-        marker_size_cm = st.sidebar.number_input("Marker side length (cm)", value=DEFAULT_MARKER_SIZE_CM, min_value=0.1, step=0.5)
-        st.sidebar.caption("Falls back to pixels-only for any photo without a detected marker.")
-    else:
+    if scale_mode.startswith("I know my cm"):
         manual_cm_per_pixel = st.sidebar.number_input(
-            "cm per pixel", value=0.02, min_value=0.0001, step=0.001, format="%.4f"
+            "cm per pixel", value=0.02, min_value=0.0001, step=0.001, format="%.4f",
+            help="Known scale for your camera setup (e.g. derived once from a ruler photo).",
+        )
+    else:
+        ref_width_cm = st.sidebar.number_input(
+            "Reference object width (cm)", value=8.56, min_value=0.01, step=0.1,
+            help="Real-world width of a reference object visible in the photo (e.g. a card).",
+        )
+        ref_width_px = st.sidebar.number_input(
+            "Reference object width in photo (px)", value=240.0, min_value=1.0, step=1.0,
+            help="How wide that same reference object measures in the photo, in pixels.",
         )
 
-with st.sidebar.expander("Advanced settings"):
+with st.sidebar.expander("Perspective rectification (optional)"):
     st.caption(
-        "Denoise/enhance here only affect image display quality and the local "
-        "re-segmentation used to build each fruit's mask/crop within its YOLO box — "
-        "neither YOLO nor the CNN quality model needs these to match any particular "
-        "training preprocessing (unlike the old SVM pipeline)."
+        "Straightens the image plane before measurement if the camera isn't "
+        "perfectly perpendicular to the inspection surface."
     )
-    denoise_method = st.selectbox("Denoise method", ["median", "gaussian", "bilateral"], index=0)
-    enhance_method = st.selectbox("Enhance method", ["clahe", "histogram_equalize", "contrast_stretch", "none"], index=0)
+    want_rectify = st.checkbox("Enable perspective rectification", value=False)
+    rectify_mode = "Auto-detect (largest rectangle in photo)"
+    rectify_points = None
+    if want_rectify:
+        rectify_mode = st.radio("How to find the 4 corners?",
+                                 ["Auto-detect (largest rectangle in photo)", "Enter coordinates manually"])
+        if rectify_mode.startswith("Auto"):
+            st.caption(
+                "Looks for the largest 4-sided shape in each photo (e.g. a tray, "
+                "card, or table edge) and uses it as the reference. Less reliable "
+                "than a coded marker — no unique identity to lock onto, so it can "
+                "pick the wrong shape in a cluttered frame. Falls back to no "
+                "rectification for a photo if nothing suitable is found."
+            )
+        else:
+            st.caption(
+                "Pixel coordinates of the 4 corners of a flat reference region "
+                "(e.g. the tray/table edges), any order."
+            )
+            rc1, rc2 = st.columns(2)
+            x1 = rc1.number_input("Corner 1 — x", value=0, step=1)
+            y1 = rc2.number_input("Corner 1 — y", value=0, step=1)
+            x2 = rc1.number_input("Corner 2 — x", value=100, step=1)
+            y2 = rc2.number_input("Corner 2 — y", value=0, step=1)
+            x3 = rc1.number_input("Corner 3 — x", value=100, step=1)
+            y3 = rc2.number_input("Corner 3 — y", value=100, step=1)
+            x4 = rc1.number_input("Corner 4 — x", value=0, step=1)
+            y4 = rc2.number_input("Corner 4 — y", value=100, step=1)
+            rectify_points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], dtype=np.float32)
+
+with st.sidebar.expander("Advanced settings"):
     erode_pixels = st.slider("Mask erosion (px)", 0, 30, DEFAULT_ERODE_PIXELS,
                               help="Trims mixed-color boundary patches between fruit and background.")
     yolo_confidence = st.slider("YOLO confidence threshold", 0.05, 0.9, DEFAULT_YOLO_CONFIDENCE, step=0.05,
@@ -163,9 +205,9 @@ with st.sidebar.expander("Advanced settings"):
 def get_calibration(image):
     if not want_measurements:
         return calib.uncalibrated()
-    if calib_mode.startswith("Auto"):
-        return calib.calibrate(image, marker_size_cm=marker_size_cm, manual_cm_per_pixel=None)
-    return calib.manual_scale(manual_cm_per_pixel)
+    if scale_mode.startswith("I know my cm"):
+        return calib.manual_scale(manual_cm_per_pixel)
+    return calib.manual_reference(ref_width_cm, ref_width_px)
 
 
 # ======================================================
@@ -199,12 +241,19 @@ if run_button:
     results = []
     progress = st.progress(0.0, text="Running pipeline...")
     for i, (name, img) in enumerate(images_to_process):
+        if want_rectify:
+            if rectify_mode.startswith("Auto"):
+                auto_quad = calib.detect_reference_quad(img)
+                if auto_quad is not None:
+                    img = calib.rectify_perspective(img, auto_quad)
+            elif rectify_points is not None:
+                img = calib.rectify_perspective(img, rectify_points)
         calibration_result = get_calibration(img)
         out = inspect_image_yolo(
             img,
             calibration=calibration_result,
-            denoise_method=denoise_method,
-            enhance_method=enhance_method,
+            denoise_method=DENOISE_METHOD,
+            enhance_method=ENHANCE_METHOD,
             erode_pixels=erode_pixels,
             yolo_confidence=yolo_confidence,
         )
@@ -252,6 +301,7 @@ if results:
                 "Type Conf": f"{obj.get('fruit_type_confidence', 0) * 100:.1f}%" if obj.get("fruit_type") else "—",
                 "Quality": obj.get("label") or "—",
                 "Quality Conf": f"{obj.get('confidence', 0) * 100:.1f}%" if obj.get("label") else "—",
+                "Wound %": f"{obj.get('defect_fraction', 0) * 100:.1f}%",
                 "Width (cm)": f"{obj['width_cm']:.2f}" if obj.get("width_cm") is not None else "—",
                 "Height (cm)": f"{obj['height_cm']:.2f}" if obj.get("height_cm") is not None else "—",
                 "Area (cm^2)": f"{obj['area_cm2']:.2f}" if obj.get("area_cm2") is not None else "—",
@@ -259,7 +309,7 @@ if results:
                 "Height (px)": f"{obj.get('height_px', 0):.0f}",
             })
     df = pd.DataFrame(table_rows)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     csv = df.to_csv(index=False).encode("utf-8")
     dl_col1, dl_col2 = st.columns(2)
@@ -283,8 +333,8 @@ if results:
     for r in results:
         with st.expander(f"{r['filename']}  —  {r['count']} fruit(s): {summary_to_text(r['summary'])}"):
             c1, c2 = st.columns(2)
-            c1.image(bgr_to_rgb(r["original"]), caption="Original", use_container_width=True)
-            c2.image(bgr_to_rgb(r["annotated"]), caption="Detected fruits (bbox + contour + label)", use_container_width=True)
+            c1.image(bgr_to_rgb(r["original"]), caption="Original", width="stretch")
+            c2.image(bgr_to_rgb(r["annotated"]), caption="Detected fruits (bbox + contour + label)", width="stretch")
 
             if not r["objects"]:
                 st.warning("No fruit detected in this photo.")
@@ -294,7 +344,7 @@ if results:
             crop_cols = st.columns(len(r["objects"]))
             for obj, col in zip(r["objects"], crop_cols):
                 caption = f"#{obj['index'] + 1} {obj.get('fruit_type') or '?'} {obj.get('label') or '?'}"
-                col.image(bgr_to_rgb(obj["crop_isolated"]), caption=caption, use_container_width=True)
+                col.image(bgr_to_rgb(obj["crop_isolated"]), caption=caption, width="stretch")
 
             for obj in r["objects"]:
                 st.markdown(f"**Fruit #{obj['index'] + 1}**")

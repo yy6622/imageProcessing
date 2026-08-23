@@ -34,6 +34,18 @@ class after stripping out rotated/flipped/noise-augmented duplicates)
 results from that little labeled data, rather than training a CNN from
 scratch (which typically wants thousands of unique images per class).
 
+Every image (train AND validation) is run through the SAME
+preprocessing app.py applies at inference time — median denoise +
+CLAHE contrast enhancement (see TRAIN_DENOISE_METHOD/TRAIN_ENHANCE_METHOD
+below and preprocessing.py) — before it ever reaches the CNN. This has
+to match exactly: feeding the trained model differently-processed
+images at inference than it saw during training is a real accuracy
+hit, not a cosmetic mismatch (confirmed directly — wiring denoise/
+enhance into inference without updating training made predictions
+worse). If you ever change app.py's DENOISE_METHOD/ENHANCE_METHOD,
+update TRAIN_DENOISE_METHOD/TRAIN_ENHANCE_METHOD here to match and
+retrain, or revert both back to raw/no preprocessing together.
+
 SETUP (run on your own machine — NOT verified in this sandbox; see the
 note at the bottom of this docstring for why)
 -------------------------------------------------------------
@@ -95,6 +107,53 @@ BATCH_SIZE = 16
 EPOCHS = 15
 LEARNING_RATE = 1e-4
 VAL_SPLIT = 0.2
+
+# MUST match app.py's DENOISE_METHOD / ENHANCE_METHOD. inspect_image_yolo()
+# feeds this CNN a median-denoised + CLAHE-enhanced crop at inference time
+# (not the raw photo) — if training doesn't apply the exact same
+# preprocessing to every image it sees, the model is being evaluated on a
+# different-looking input distribution than it was trained on, which
+# measurably hurt accuracy (confirmed: wiring denoise/enhance into
+# inference without retraining made predictions worse, not better).
+TRAIN_DENOISE_METHOD = "median"
+TRAIN_ENHANCE_METHOD = "clahe"
+
+
+def prepare_cnn_input_bgr(raw_bgr, denoise_method=TRAIN_DENOISE_METHOD, enhance_method=TRAIN_ENHANCE_METHOD, mask_background=True):
+    """
+    Single source of truth for turning ONE raw BGR image of a fruit
+    (a training photo, or an inference-time crop) into exactly what the
+    CNN is trained and queried on: resize -> denoise -> enhance ->
+    (optional) background-mask. Called by BOTH
+    FruitQualityDataset.__getitem__() (training) and
+    colorDetection.classify_quality_cnn() (inference) so the two paths
+    can never silently drift apart again.
+
+    This replaced a real, confirmed bug: inference used to build its
+    CNN input by running CLAHE on the whole multi-fruit SCENE (e.g.
+    512x512) and only cropping down to one fruit afterward, while
+    training ran CLAHE on a single-fruit image already resized to
+    IMAGE_SIZE. Both used clip_limit=... and an 8x8 tile grid, but tile
+    size is a FRACTION of whatever image it's given — so training's
+    tiles were small relative to the fruit (image ~= the fruit) while
+    inference's tiles were large relative to the fruit (image = a whole
+    scene containing several fruits). Same method name, genuinely
+    different output; retuning clip_limit alone couldn't fix a
+    structural scale mismatch. Routing both call sites through this one
+    function on a RAW, not-yet-enhanced crop removes that mismatch by
+    construction.
+    """
+    import cv2
+    import preprocessing as prep
+    from segmentation import segmentation_mask_and_contour
+
+    bgr = cv2.resize(raw_bgr, (IMAGE_SIZE, IMAGE_SIZE))
+    bgr = prep.preprocess_image(bgr, denoise_method=denoise_method, enhance_method=enhance_method)
+    if mask_background:
+        mask, contour = segmentation_mask_and_contour(bgr)
+        if contour is not None:
+            bgr = cv2.bitwise_and(bgr, bgr, mask=mask)
+    return bgr
 
 
 _AUG_PREFIX_RE = re.compile(
@@ -196,7 +255,23 @@ def _build_transforms(train: bool):
             transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(20),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+            # hue=0.04 added (was missing entirely — only brightness/
+            # contrast/saturation were jittered before). Without hue
+            # jitter, the model can take a shortcut: "very saturated /
+            # dark red overall = Rotten" — plausible in this dataset
+            # since some Fresh apple varieties (Red Delicious, Gala) are
+            # naturally deep red, and background-masking (added earlier
+            # this session) removed the surrounding scene, leaving the
+            # fruit's own average color as an even easier, more dominant
+            # signal than before. Jittering hue during training forces
+            # the model to NOT rely on "what exact shade of red is this"
+            # as a free label predictor, pushing it toward texture cues
+            # (spots, wrinkles, discoloration patterns) instead — the
+            # cues that actually distinguish Fresh from Rotten. Kept
+            # small (0.04, PyTorch's hue factor is on a 0-0.5 scale)
+            # since real fruit hue shouldn't shift far before it stops
+            # looking like a plausible apple.
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1, hue=0.04),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
@@ -246,9 +321,44 @@ class FruitQualityDataset:
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # Local imports (not module-level) for the same reason PIL is
+        # imported locally elsewhere in this file: Windows
+        # DataLoader(num_workers>0) pickles the whole Dataset to send to
+        # worker processes, and module objects stored as instance
+        # attributes aren't picklable.
+        import cv2
+        import numpy as np
         from PIL import Image
+
         path, label, _key = self.samples[idx]
-        image = Image.open(path).convert("RGB")
+        bgr = cv2.imread(path)
+        if bgr is None:
+            # Fall back to PIL for any file cv2 can't decode, then convert
+            # to a BGR array so it goes through the same preprocessing path.
+            try:
+                pil_fallback = Image.open(path).convert("RGB")
+                bgr = np.array(pil_fallback)[:, :, ::-1].copy()
+            except (FileNotFoundError, OSError) as exc:
+                # A path returned by the initial glob.glob() scan can still
+                # fail to open later — seen in practice with a file that
+                # glob listed but that was missing/unreadable by the time
+                # training reached it (cloud-sync placeholder, moved/
+                # deleted file, etc.). Crashing the whole multi-hour run
+                # over one bad sample is worse than dropping it, so log
+                # once and substitute a different, working sample instead.
+                print(f"[WARN] Skipping unreadable training image: {path} ({exc})")
+                fallback_idx = (idx + 1) % len(self.samples)
+                return self.__getitem__(fallback_idx)
+
+        # resize -> denoise -> enhance -> background-mask, via the same
+        # function colorDetection.classify_quality_cnn() calls at
+        # inference time — see prepare_cnn_input_bgr()'s docstring above
+        # for why this has to be the literal same code path, not just
+        # "the same method names."
+        bgr = prepare_cnn_input_bgr(bgr)
+
+        image = Image.fromarray(bgr[:, :, ::-1])  # BGR -> RGB
+
         if self.transform:
             image = self.transform(image)
         return image, label
@@ -356,11 +466,7 @@ def load_cnn_model(path):
     return model, classes
 
 
-def predict_quality(model, classes, image_or_path):
-    """
-    image_or_path: a file path, a PIL Image, or a BGR numpy array
-    (OpenCV convention — auto-converted to RGB). Returns (label, confidence).
-    """
+def _predict_quality_impl(model, classes, image_or_path):
     import torch
     import numpy as np
     from PIL import Image
@@ -379,7 +485,30 @@ def predict_quality(model, classes, image_or_path):
         logits = model(tensor)
         probs = torch.softmax(logits, dim=1)[0]
         idx = int(probs.argmax())
-        return classes[idx], float(probs[idx])
+        probs_dict = {classes[i]: float(probs[i]) for i in range(len(classes))}
+        return classes[idx], float(probs[idx]), probs_dict
+
+
+def predict_quality(model, classes, image_or_path):
+    """
+    image_or_path: a file path, a PIL Image, or a BGR numpy array
+    (OpenCV convention — auto-converted to RGB). Returns (label, confidence).
+    """
+    label, confidence, _probs = _predict_quality_impl(model, classes, image_or_path)
+    return label, confidence
+
+
+def predict_quality_with_probs(model, classes, image_or_path):
+    """
+    Same as predict_quality(), but also returns the full class ->
+    softmax-probability dict (not just the top pick). Used by
+    colorDetection.py's defect-override logic: when the CNN's top
+    choice is "Rotten" but detect_defect_fraction() found no real
+    localized wound to back that up, it needs the "next best guess"
+    between the remaining classes (Fresh/Unripe) rather than just a
+    single label with no alternative to fall back to.
+    """
+    return _predict_quality_impl(model, classes, image_or_path)
 
 
 def main():

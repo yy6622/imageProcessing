@@ -88,12 +88,21 @@ def contrast_stretch(image, lower_percentile=2, upper_percentile=98):
     return result
 
 
-def clahe_enhance(image, clip_limit=2.0, tile_grid_size=(8, 8)):
+def clahe_enhance(image, clip_limit=1.0, tile_grid_size=(8, 8)):
     """
     Contrast Limited Adaptive Histogram Equalization applied to the L
     channel in LAB color space. Improves local contrast (good for
     unevenly lit product photos) without blowing out color saturation
     the way global histogram equalization on BGR channels would.
+
+    clip_limit=1.0 (was 2.0): on a small, already-cropped single-fruit
+    image, each of the 8x8 tiles only spans ~20px, so a higher clip
+    limit was locally over-amplifying ordinary shading/highlight
+    variation on smooth apple skin into blotchy dark patches — visually
+    similar to rot, and the CNN was picking that up (confirmed: fresh
+    red apples with normal specular highlights were flipping to
+    "Rotten" only after CLAHE). Lower clip_limit caps how far any tile's
+    histogram can be stretched, directly limiting that over-enhancement.
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
