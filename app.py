@@ -39,6 +39,10 @@ st.set_page_config(page_title="Fruit Quality Inspection Dashboard", layout="wide
 
 DEFAULT_ERODE_PIXELS = 10
 DEFAULT_YOLO_CONFIDENCE = 0.25
+# Only used by the Stem Detection section's own ArUco-marker calibration —
+# the main pipeline's calibration no longer uses marker size (manual
+# cm-per-pixel only).
+DEFAULT_MARKER_SIZE_CM = 5.0
 
 DENOISE_METHOD = "median"
 ENHANCE_METHOD = "clahe"
