@@ -1,13 +1,5 @@
 """Stem/crown/calyx detection: Traditional (classical CV), YOLO, Hybrid, and
-Automatic (YOLO with a traditional fallback).
-
-Mode A requirement this satisfies: "Technical Requirement: Implement and
-benchmark multiple techniques" — the three underlying techniques
-(detect_traditional / detect_yolo / detect_hybrid) are kept as separate,
-independently callable methods so metrics.run_benchmark() can compare them
-directly, while detect() (Automatic) is the single method app.py's normal
-user workflow relies on.
-"""
+Automatic (YOLO with a traditional fallback)."""
 
 from __future__ import annotations
 
@@ -27,16 +19,13 @@ try:
 except ImportError:
     _ULTRALYTICS_AVAILABLE = False
 
-# Prefer locally trained V3 weights; fall back to the generic production
-# path used by train_stem_yolo.py's "copy to models/best.pt" instructions.
+# Prefer locally trained weights; fall back to the standard models/ path.
 _DEFAULT_MODEL_CANDIDATES = (
     "runs/detect/fruit_stem_detector_v3/weights/best.pt",
     "models/best.pt",
 )
 
-# Stems/crowns read as either a desaturated green (fresh) or a dark brown
-# (dried/senescent) blob in HSV — both are covered so the traditional path
-# isn't tied to only-fresh produce.
+# Stems/crowns show up as green (fresh) or brown (dried) in HSV.
 _STEM_HSV_RANGES = (
     ((25, 40, 20), (95, 255, 200)),   # green
     ((5, 30, 20), (25, 200, 150)),    # brown
@@ -69,12 +58,7 @@ class StemDetector:
                 self._model = None
                 self.yolo_ready = False
 
-    # ------------------------------------------------------------------
-    # Traditional: classical HSV segmentation + morphology, no model file
-    # needed. Stems sit near the top of the fruit in typical product
-    # photos, so the search is restricted to that band to cut down on
-    # false positives from background clutter.
-    # ------------------------------------------------------------------
+    # Traditional: classical HSV segmentation + morphology, no model needed.
     def detect_traditional(
         self, image: np.ndarray, fruit_type: str, top_fraction: float = 0.45,
     ) -> tuple[list[Detection], float, str]:
@@ -84,10 +68,7 @@ class StemDetector:
         return detections, elapsed, "traditional"
 
     def traditional_mask(self, image: np.ndarray, top_fraction: float = 0.45) -> np.ndarray:
-        """The binary stem-colour candidate mask the Traditional method
-        filters into contours — exposed on its own so the UI can show it as
-        a "candidate regions" step, independent of which method actually
-        ran for a given detection."""
+        """Binary stem-colour mask before contour extraction, exposed for the UI."""
         h, w = image.shape[:2]
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
@@ -128,12 +109,7 @@ class StemDetector:
         detections = _non_max_suppression(detections, iou_threshold=0.3)
         return detections[:3]
 
-    # ------------------------------------------------------------------
-    # YOLO: single-class ("Fruit-Stem-Detection") model trained by
-    # train_stem_yolo.py. Silently returns no detections if no model
-    # file was found/loaded — callers check yolo_ready to distinguish
-    # "not available" from "ran and found nothing".
-    # ------------------------------------------------------------------
+    # YOLO: single-class model trained by train_stem_yolo.py.
     def detect_yolo(
         self, image: np.ndarray, fruit_type: str, confidence: float = 0.25,
     ) -> tuple[list[Detection], float]:
@@ -150,13 +126,7 @@ class StemDetector:
         elapsed = perf_counter() - start
         return detections, elapsed
 
-    # ------------------------------------------------------------------
-    # Hybrid: union of YOLO + Traditional, de-duplicated by IoU (YOLO
-    # takes precedence on overlapping boxes since it's the trained model —
-    # it sorts first because detect_yolo's boxes are listed before
-    # detect_traditional's, and NMS keeps the highest-confidence box in
-    # each overlapping cluster).
-    # ------------------------------------------------------------------
+    # Hybrid: union of YOLO + Traditional, de-duplicated by IoU.
     def detect_hybrid(
         self, image: np.ndarray, fruit_type: str, yolo_confidence: float = 0.25,
         iou_merge_threshold: float = 0.3,
@@ -169,12 +139,7 @@ class StemDetector:
         elapsed = perf_counter() - start
         return merged, elapsed
 
-    # ------------------------------------------------------------------
-    # Automatic: the single method the normal (non-benchmark) app.py
-    # workflow uses. Runs YOLO at the caller-supplied (already permissive)
-    # threshold, sanity-checks the boxes, and falls back to Traditional
-    # when YOLO is unavailable or returns nothing plausible.
-    # ------------------------------------------------------------------
+    # Automatic: runs YOLO, falls back to Traditional if unavailable/empty.
     def detect(
         self, image: np.ndarray, fruit_type: str, method: str = "Automatic",
         yolo_confidence: float = 0.25, skip_preprocess: bool = False,
@@ -217,7 +182,6 @@ class StemDetector:
             valid.append(d)
         return valid
 
-    # ------------------------------------------------------------------
     def annotate(self, image: np.ndarray, detections: list[Detection]) -> np.ndarray:
         annotated = image.copy()
         for d in detections:
@@ -235,10 +199,7 @@ class StemDetector:
 
 
 def _non_max_suppression(detections: list[Detection], iou_threshold: float = 0.4) -> list[Detection]:
-    """Greedy NMS: repeatedly keep the highest-confidence remaining box and
-    drop any other box that overlaps it above iou_threshold (a duplicate/
-    split detection of the same stem), so one stem doesn't show up as
-    several stacked boxes."""
+    """Greedy NMS: keep the highest-confidence box, drop overlapping duplicates, repeat."""
     remaining = sorted(detections, key=lambda d: d.confidence, reverse=True)
     kept: list[Detection] = []
     while remaining:

@@ -1,13 +1,5 @@
 """Preprocessing: noise removal + image enhancement.
 
-Core Functional Requirement: "Implement noise removal and image enhancement
-techniques (e.g., Gaussian/Median filtering, contrast stretching)."
-
-Each step is a separate, independently selectable technique rather than one
-fixed pipeline, so they can be compared against each other (which is the
-whole point of Mode A - Comparative & Enhancement Study) instead of just
-being hard-coded into StemDetector.preprocess().
-
 Usage:
     denoised = denoise(image, method="median")
     enhanced = enhance(denoised, method="clahe")
@@ -25,16 +17,11 @@ ENHANCE_METHODS = ("clahe", "histogram_equalize", "contrast_stretch", "none")
 def denoise(image: np.ndarray, method: str = "median") -> np.ndarray:
     """Remove noise from a BGR image.
 
-    - "median": cv2.medianBlur. Good at removing salt-and-pepper style
-      speckle noise (common in cheap camera sensors / compression
-      artifacts) while keeping edges reasonably sharp. This is what
-      StemDetector already used internally.
-    - "gaussian": cv2.GaussianBlur. Smoother, more even blur; better for
-      general sensor noise but softens edges more than median.
-    - "bilateral": cv2.bilateralFilter. Slower, but smooths flat regions
-      while preserving edges much better than either of the above - the
-      trade-off is it can leave more noise in busy/textured areas.
-    - "none": passthrough, useful as a baseline for comparison.
+    - "median": good at speckle noise, keeps edges reasonably sharp.
+    - "gaussian": smoother overall blur, softens edges more.
+    - "bilateral": slower, preserves edges better, leaves more noise in
+      textured areas.
+    - "none": passthrough, for baseline comparison.
     """
     if method == "median":
         return cv2.medianBlur(image, 5)
@@ -48,21 +35,12 @@ def denoise(image: np.ndarray, method: str = "median") -> np.ndarray:
 
 
 def enhance(image: np.ndarray, method: str = "clahe") -> np.ndarray:
-    """Enhance contrast/detail in a BGR image.
+    """Enhance contrast/detail in a BGR image (operates on the LAB lightness channel).
 
-    - "clahe": Contrast Limited Adaptive Histogram Equalization on the LAB
-      lightness channel. Boosts local contrast without blowing out
-      already-bright regions the way global equalization can. This is
-      what StemDetector already used internally.
-    - "histogram_equalize": global histogram equalization on the LAB
-      lightness channel. Simpler and faster than CLAHE, but can over-brighten
-      large uniform areas (e.g. a plain background) since it has no local
-      windowing.
-    - "contrast_stretch": linear min-max normalization of the lightness
-      channel to the full 0-255 range. Cheapest option; does nothing if the
-      image already uses the full range, but helps a washed-out/low-contrast
-      photo.
-    - "none": passthrough, useful as a baseline for comparison.
+    - "clahe": local adaptive contrast, avoids blowing out bright regions.
+    - "histogram_equalize": global equalization, simpler but can over-brighten.
+    - "contrast_stretch": linear min-max stretch, cheapest option.
+    - "none": passthrough, for baseline comparison.
     """
     if method == "none":
         return image.copy()

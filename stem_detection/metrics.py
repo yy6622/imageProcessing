@@ -1,14 +1,5 @@
 """Quantitative comparison of the Traditional / YOLO / Hybrid stem-detection
-techniques.
-
-Mode A requirements this satisfies:
-    - "Technical Requirement: Implement and benchmark multiple techniques."
-    - "Experimental Evaluation: Compare techniques using quantitative
-      metrics and determine the best-performing approach."
-
-Metrics per method: detection rate (did it find a stem at all), mean
-confidence, and mean processing time — no ground-truth boxes required.
-"""
+techniques: detection rate, mean confidence, and mean processing time."""
 
 from __future__ import annotations
 
@@ -37,15 +28,10 @@ def run_benchmark(
     detector: Optional[StemDetector] = None,
     yolo_confidence: float = 0.25,
 ) -> pd.DataFrame:
-    """Run every method against every image and return one row per
-    (image, method) combination.
+    """Run every method against every image; one row per (image, method).
 
     images: list of (filename, fruit_type, bgr_image) tuples.
-    methods: which of the three techniques to compare. YOLO/Hybrid are
-        silently skipped per-image with a zero/False row if no model is
-        available (detector.yolo_ready is False), so a comparison can still
-        run and clearly show "Traditional worked, YOLO wasn't available"
-        rather than crashing the whole benchmark.
+    YOLO/Hybrid are skipped with a zero row if no model is loaded.
     """
     detector = detector or StemDetector()
     rows: list[BenchmarkRow] = []
@@ -63,7 +49,6 @@ def run_benchmark(
                 else:
                     detections, elapsed = detector.detect_hybrid(image, fruit_type, yolo_confidence)
             except FileNotFoundError:
-                # YOLO model file missing - same "not available" outcome as above.
                 rows.append(BenchmarkRow(filename, fruit_type, method, False, 0.0, 0.0))
                 continue
 
@@ -79,8 +64,7 @@ def run_benchmark(
 
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse the per-image benchmark rows into one row per method -
-    the actual "compare techniques, determine best-performing approach" table."""
+    """Collapse the per-image benchmark rows into one row per method."""
     summary = df.groupby("method").agg(
         detected=("detected", "mean"),
         confidence=("confidence", lambda s: s[s > 0].mean() if (s > 0).any() else 0.0),
@@ -95,19 +79,12 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_analysis_text(summary: pd.DataFrame) -> str:
-    """Turn the aggregated benchmark summary into a short written discussion,
-    instead of leaving the reader to interpret the raw numbers themselves —
-    satisfies the Mode A "Experimental Evaluation: ... determine the
-    best-performing approach" requirement with an actual conclusion.
-    """
+    """Turn the aggregated benchmark summary into a short written discussion."""
     if summary.empty:
         return "No benchmark results available."
 
     lines = []
-    # Break ties on detection rate by speed (not alphabetically, which is
-    # what .idxmax() alone would do) — if two methods find the same number
-    # of stems, the faster one is the genuinely better result, not whichever
-    # method name happens to sort first.
+    # Ties broken by speed, not alphabetically.
     top_rate = summary["detection_rate"].max()
     tied_for_top = summary[summary["detection_rate"] == top_rate]
     best_detection = tied_for_top.loc[tied_for_top["mean_processing_ms"].idxmin()]

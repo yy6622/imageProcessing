@@ -1,16 +1,9 @@
 """Image calibration: pixel-to-physical-size scaling.
 
-Core Functional Requirement: "Image Calibration: Perform spatial scaling and
-rectification to maintain consistency between pixel dimensions and physical
-measurements."
-
-Approach: place a printed ArUco marker of known real-world side length next
-to the fruit in the photo. Detecting the marker's pixel size gives a
-cm-per-pixel ratio, which converts any bounding box or contour measurement
-in the photo from pixels to real-world units. Falls back to a manually
-supplied ratio, or stays uncalibrated (pixel-only output) if neither is
-available - detection still works without calibration, it just can't report
-sizes in cm.
+Detects a printed ArUco marker of known side length to derive a
+cm-per-pixel ratio, converting bounding box/contour measurements from
+pixels to real-world units. Falls back to a manually supplied ratio, or
+stays uncalibrated (pixel-only) if neither is available.
 """
 
 from __future__ import annotations
@@ -21,9 +14,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# Any of these dictionaries will be tried, since we don't know in advance
-# which one a given printed marker uses. 4X4_50 is the most common choice
-# for a single small printed marker and is tried first.
+# Tried in order since the marker's dictionary type isn't known in advance.
 _ARUCO_DICTIONARIES = (
     cv2.aruco.DICT_4X4_50,
     cv2.aruco.DICT_5X5_50,
@@ -84,10 +75,8 @@ def _detect_aruco_scale(image: np.ndarray, marker_size_cm: float) -> Optional[Ca
         if ids is None or len(corners) == 0:
             continue
 
-        # Average the marker's side length in pixels across all four
-        # sides, and across every marker found (in case more than one is
-        # in frame), rather than trusting a single edge measurement, which
-        # is more sensitive to a marker viewed at a slight angle.
+        # Average all four sides across every marker found, more robust
+        # than a single edge if the marker is viewed at an angle.
         side_lengths_px = []
         for marker_corners in corners:
             pts = marker_corners.reshape(4, 2)

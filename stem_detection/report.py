@@ -1,8 +1,4 @@
-"""PDF report generation.
-
-Extra Effort requirement: "Reporting: Automated export of results and
-findings into PDF format."
-"""
+"""PDF report generation for stem detection results."""
 
 from __future__ import annotations
 
@@ -41,20 +37,11 @@ def generate_report(
     title: str = "Fruit Stem Detection Report",
     analysis_text: Optional[str] = None,
 ) -> None:
-    """Build a PDF summarizing detection results (and, optionally, the
-    Traditional/YOLO/Hybrid benchmark comparison) across one or more images.
+    """Build a PDF summarizing detection results, and optionally the
+    Traditional/YOLO/Hybrid benchmark comparison, across one or more images.
 
-    `results` is a list of per-image dicts, one per processed photo:
-        {
-            "filename": str,
-            "annotated": np.ndarray (BGR),   # image with boxes/contours drawn
-            "detections": list[Detection],
-            "fruit_type": str,
-            "method": str,
-            "calibration": CalibrationResult | None,
-        }
-    This mirrors what app.py builds per uploaded image, so app.py can pass
-    its results list straight through.
+    `results` is a list of per-image dicts (filename, annotated, detections,
+    fruit_type, method, calibration) matching what app.py builds.
     """
     doc = SimpleDocTemplate(str(output_path), pagesize=A4,
                              topMargin=1.5 * cm, bottomMargin=1.5 * cm)

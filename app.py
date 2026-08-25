@@ -61,10 +61,7 @@ def read_upload_to_bgr(uploaded_file):
 
 
 def infer_freshness_from_filename(filename):
-    """Best-effort Fresh/Rotten label from filename conventions common in
-    fruit-freshness datasets (e.g. "FreshApple (12).jpg", "RottenBanana_3.png").
-    Returns None when the filename gives no hint — those images are excluded
-    from freshness-based analysis rather than guessed at."""
+    """Best-effort Fresh/Rotten label from filename (e.g. "FreshApple (12).jpg")."""
     lower = filename.lower()
     if "fresh" in lower:
         return "Fresh"
@@ -74,8 +71,7 @@ def infer_freshness_from_filename(filename):
 
 
 def stem_quality_tier(confidence):
-    """Translate a raw confidence score into a plain-language tier for
-    non-technical users, instead of exposing the number on its own."""
+    """Translate a raw confidence score into a plain-language tier."""
     if not confidence or confidence <= 0:
         return "No Reliable Stem Detected"
     if confidence >= 0.5:
@@ -113,8 +109,6 @@ selected_technique = st.sidebar.selectbox(
          "segmentation + YOLO + CNN) — the others are placeholders for "
          "teammates' modules and don't change what actually runs below.",
 )
-# Stem Detection is implemented as its own pipeline below. Only the remaining
-# teammate placeholders should show the "not implemented" notice.
 if selected_technique not in (IMPLEMENTED_TECHNIQUE, "Stem Detection"):
     st.sidebar.caption(
         f"ℹ️ “{selected_technique}” isn't implemented in this module yet — "
@@ -122,13 +116,8 @@ if selected_technique not in (IMPLEMENTED_TECHNIQUE, "Stem Detection"):
     )
 
 # ======================================================
-# Stem Detection — self-contained section. The normal user workflow uses
-# one Automatic pipeline; Traditional / YOLO / Hybrid remain available only
-# in the benchmark for the Mode A comparative study. The actual
-# detection/preprocessing/calibration/metrics/reporting/video logic lives
-# in the stem_detection package. Runs instead of, not alongside, the
-# Colour Feature Extraction pipeline below, so it needs its own settings
-# and its own file uploader rather than sharing state with that pipeline.
+# Stem Detection — self-contained section, runs instead of the Colour
+# Feature Extraction pipeline below.
 # ======================================================
 if selected_technique == "Stem Detection":
     from stem_detection import calibration as stem_calib
@@ -138,21 +127,10 @@ if selected_technique == "Stem Detection":
     from stem_detection.detector import StemDetector
 
     st.sidebar.subheader("Stem Detection settings")
-    # Fruit type doesn't change the detection logic (same detector runs
-    # regardless), so it isn't exposed as a choice — kept as a fixed label
-    # only for the results table / report / video output.
     stem_fruit_type = "Fruit"
-    # The final prototype uses one automatic pipeline. End users do not need
-    # to understand or choose between Traditional / YOLO / Hybrid methods.
-    # The separate methods are still retained in detector.py and in the
-    # benchmark tab for the Mode A experimental comparison.
     stem_method = "Automatic"
 
-    # Developer configuration is intentionally hidden from normal users.
-    # Automatic mode runs YOLO at a permissive internal threshold, validates
-    # the proposals, then falls back to the traditional detector when needed.
-    # Prefer the locally trained V4 weights (trained on the original set plus
-    # added mango/strawberry examples). Falls back to V3, then models/best.pt.
+    # Prefer the locally trained V4 weights, fall back to V3 then models/best.pt.
     _stem_model_candidates = [
         "runs/detect/fruit_stem_detector_v4/weights/best.pt",
         "runs/detect/fruit_stem_detector_v3/weights/best.pt",
@@ -177,8 +155,6 @@ if selected_technique == "Stem Detection":
             "continue with the traditional image-processing fallback."
         )
 
-    # Fixed preprocessing defaults: still applied by the backend, but hidden
-    # from the normal user interface to keep the sidebar simple and consistent.
     stem_denoise_method = "median"
     stem_enhance_method = "clahe"
 
@@ -329,10 +305,7 @@ if selected_technique == "Stem Detection":
             if stem_freshness_rows:
                 st.divider()
                 st.header("Stem visibility vs. freshness")
-                st.caption(
-                    "Freshness is inferred from each filename (e.g. \"FreshApple\", \"RottenBanana\"), "
-                    "not a separate classifier — only images where this could be inferred are included."
-                )
+                st.caption("Freshness inferred from filename (e.g. \"FreshApple\"). Images without a hint are excluded.")
                 stem_fresh_df = pd.DataFrame(stem_freshness_rows)
                 stem_fresh_summary = stem_fresh_df.groupby("freshness").agg(
                     stem_detection_rate=("stem_detected", "mean"),
@@ -353,13 +326,9 @@ if selected_technique == "Stem Detection":
                     rate_diff = fresh_row["stem_detection_rate"].iloc[0] - rotten_row["stem_detection_rate"].iloc[0]
                     if abs(rate_diff) >= 0.1:
                         direction = "higher" if rate_diff > 0 else "lower"
-                        st.info(
-                            f"Stems were detected {abs(rate_diff):.0%} {direction} on Fresh-labelled photos "
-                            f"than Rotten-labelled ones in this batch — consistent with stems drying up, "
-                            f"detaching, or degrading visually as fruit spoils."
-                        )
+                        st.info(f"Stem detection rate was {abs(rate_diff):.0%} {direction} on Fresh vs Rotten photos.")
                     else:
-                        st.info("Stem detection rate was similar between Fresh and Rotten photos in this batch.")
+                        st.info("Stem detection rate was similar between Fresh and Rotten photos.")
 
             st.divider()
             st.header("Per-image detail")
@@ -384,11 +353,6 @@ if selected_technique == "Stem Detection":
                         st.caption(f"Calibration: {r['calibration'].method} - {r['calibration'].confidence}")
 
                     if st.toggle("View Detection Details (pipeline steps)", key=f"stem_pipeline_{r['filename']}"):
-                        st.caption(
-                            f"Automatic mode used **{r['method_used'].capitalize()}** for this image. "
-                            "The candidate-regions step below is always the classical HSV/morphology "
-                            "mask, shown for reference even on images where YOLO was the one that fired."
-                        )
                         pc1, pc2, pc3, pc4 = st.columns(4)
                         pc1.image(bgr_to_rgb(r["original"]), caption="1. Original", use_container_width=True)
                         pc2.image(bgr_to_rgb(r["processed"]), caption="2. Preprocessed (denoise + enhance)",
@@ -403,8 +367,9 @@ if selected_technique == "Stem Detection":
     # --- Method benchmark (Mode A comparative evaluation) ---
     with stem_tab_benchmark:
         st.write(
-            "Runs Traditional, YOLO and Hybrid against the same images you uploaded and ran "
-            "in **Image inspection** — no need to upload again."
+            "Compares three stem-detection techniques on the same images — Traditional "
+            "(classical image processing), YOLO (deep learning), and Hybrid (both combined) "
+            "— to show which one performs best."
         )
 
         stem_bench_images = [(r["filename"], "Fruit", r["original"]) for r in stem_image_results]
@@ -412,16 +377,26 @@ if selected_technique == "Stem Detection":
         if not stem_bench_images:
             st.info("Upload and run images in **Image inspection** first, then come back here to benchmark them.")
         else:
-            st.caption(f"Will benchmark the {len(stem_bench_images)} image(s) from Image inspection.")
-
             if st.button("Run benchmark", type="primary", key="stem_run_bench"):
                 with st.spinner("Running all methods..."):
                     stem_bench_df = stem_metrics.run_benchmark(
                         stem_bench_images, methods=("Traditional", "YOLO", "Hybrid"),
                         detector=stem_detector, yolo_confidence=stem_yolo_confidence,
                     )
+                    stem_bench_visuals = []
+                    for stem_bv_name, stem_bv_fruit, stem_bv_img in stem_bench_images:
+                        stem_bv_trad, _, _ = stem_detector.detect_traditional(stem_bv_img, stem_bv_fruit)
+                        stem_bv_yolo, _ = stem_detector.detect_yolo(stem_bv_img, stem_bv_fruit, stem_yolo_confidence)
+                        stem_bv_hybrid, _ = stem_detector.detect_hybrid(stem_bv_img, stem_bv_fruit, stem_yolo_confidence)
+                        stem_bench_visuals.append({
+                            "filename": stem_bv_name,
+                            "Traditional": stem_detector.annotate(stem_bv_img, stem_bv_trad),
+                            "YOLO": stem_detector.annotate(stem_bv_img, stem_bv_yolo),
+                            "Hybrid": stem_detector.annotate(stem_bv_img, stem_bv_hybrid),
+                        })
                 st.session_state["stem_bench_df"] = stem_bench_df
                 st.session_state["stem_bench_summary"] = stem_metrics.summarize(stem_bench_df)
+                st.session_state["stem_bench_visuals"] = stem_bench_visuals
 
             if "stem_bench_summary" in st.session_state:
                 st.subheader("Method comparison")
@@ -434,12 +409,23 @@ if selected_technique == "Stem Detection":
                 stem_chart2.caption("Mean processing time (ms) by method")
                 stem_chart2.bar_chart(stem_summary.set_index("method")["mean_processing_ms"])
 
-                stem_best_method = stem_summary.loc[stem_summary["detection_rate"].idxmax(), "method"]
+                stem_top_rate = stem_summary["detection_rate"].max()
+                stem_tied_top = stem_summary[stem_summary["detection_rate"] == stem_top_rate]
+                stem_best_method = stem_tied_top.loc[stem_tied_top["mean_processing_ms"].idxmin(), "method"]
                 st.success(f"Highest detection rate on this set: **{stem_best_method}**")
 
                 stem_analysis_text = stem_metrics.generate_analysis_text(stem_summary)
                 st.subheader("Analysis")
                 st.markdown(stem_analysis_text)
+
+                st.subheader("Visual comparison")
+                for stem_bv in st.session_state.get("stem_bench_visuals", []):
+                    with st.expander(stem_bv["filename"]):
+                        stem_bv_c1, stem_bv_c2, stem_bv_c3 = st.columns(3)
+                        stem_bv_c1.image(bgr_to_rgb(stem_bv["Traditional"]), caption="Traditional",
+                                          use_container_width=True)
+                        stem_bv_c2.image(bgr_to_rgb(stem_bv["YOLO"]), caption="YOLO", use_container_width=True)
+                        stem_bv_c3.image(bgr_to_rgb(stem_bv["Hybrid"]), caption="Hybrid", use_container_width=True)
 
                 with st.expander("Per-image, per-method detail"):
                     st.dataframe(
