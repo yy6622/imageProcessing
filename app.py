@@ -1,7 +1,3 @@
-"""
-Run with:
-    streamlit run app.py
-"""
 
 import os
 import tempfile
@@ -28,7 +24,11 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 CNN_MODELS_DIR = "cnn_quality_models"
-CNN_FRUIT_TYPES = ("Apple", "Banana", "Orange")
+try:
+    from train_cnn_quality import CLASS_FOLDERS as _CLASS_FOLDERS
+    CNN_FRUIT_TYPES = tuple(sorted({ftype for _, (ftype, _q) in _CLASS_FOLDERS.items()}))
+except Exception:
+    CNN_FRUIT_TYPES = ("Apple", "Banana", "Orange", "Mango", "Strawberry")
 _cnn_models_present = (
     os.path.isdir(CNN_MODELS_DIR)
     and any(os.path.isfile(os.path.join(CNN_MODELS_DIR, f"{ft}.pt")) for ft in CNN_FRUIT_TYPES)
@@ -37,16 +37,9 @@ CNN_AVAILABLE = _TORCH_AVAILABLE and _cnn_models_present
 
 st.set_page_config(page_title="Fruit Quality Inspection Dashboard", layout="wide")
 
-# Backend defaults for everything that isn't exposed in the main UI.
-# Exposed only inside the "Advanced settings" expander below.
 DEFAULT_ERODE_PIXELS = 10
 DEFAULT_YOLO_CONFIDENCE = 0.25
 
-# Denoise/enhance are fixed rather than user-selectable — median +
-# CLAHE cover the two jobs (salt-and-pepper noise removal, local
-# contrast boost) well enough for this pipeline that exposing every
-# alternative in the sidebar just added clutter without a real
-# use case for switching them at inspection time.
 DENOISE_METHOD = "median"
 ENHANCE_METHOD = "clahe"
 
@@ -64,7 +57,6 @@ def read_upload_to_bgr(uploaded_file):
 
 
 def summary_to_text(summary):
-    """{"Apple": {"Fresh": 2, "Rotten": 1}} -> 'Apple: 2 Fresh, 1 Rotten'"""
     parts = []
     for fruit_type, qualities in summary.items():
         quality_text = ", ".join(f"{n} {q}" for q, n in qualities.items())
@@ -77,14 +69,6 @@ def summary_to_text(summary):
 # ======================================================
 st.sidebar.title("Inspection Settings")
 
-# Methodology-section selector — matches the report's 2.1.x technique
-# breakdown (each teammate owns one section). Only 2.1.1 Colour Feature
-# Extraction is wired up in this module (LAB chroma-distance
-# segmentation + YOLO + CNN, below); the other sections belong to
-# teammates' modules and aren't implemented here yet. Selecting one of
-# them does NOT change what actually runs — the pipeline below always
-# executes the same Colour Feature Extraction path regardless of this
-# choice. This is a label/display selector, not a functional switch.
 IMPLEMENTED_TECHNIQUE = "Colour Feature Extraction"
 TECHNIQUE_OPTIONS = [
     IMPLEMENTED_TECHNIQUE,
@@ -110,12 +94,6 @@ if selected_technique != IMPLEMENTED_TECHNIQUE:
 
 st.sidebar.divider()
 
-# Detection + fruit TYPE: YOLOv8 only — no classical/SVM fallback.
-# Quality: CNN only — no SVM fallback either. Both stay silent in the
-# sidebar when working normally (no reassuring "it's fine" banner for
-# steady-state operation) — only surfaced here as a warning/error when
-# something's actually missing, since that's the only time the user
-# needs to act on it.
 if not YOLO_AVAILABLE:
     st.sidebar.error(
         "ultralytics (YOLO) isn't installed — detection can't run. "
@@ -137,28 +115,11 @@ if not CNN_AVAILABLE:
 st.sidebar.divider()
 want_measurements = st.sidebar.checkbox("Measure physical size (cm)", value=False)
 manual_cm_per_pixel = None
-ref_width_cm = None
-ref_width_px = None
-scale_mode = "I know my cm-per-pixel ratio"
 if want_measurements:
-    scale_mode = st.sidebar.radio(
-        "How is scale determined?",
-        ["I know my cm-per-pixel ratio", "I know a reference object's width (cm + px)"],
+    manual_cm_per_pixel = st.sidebar.number_input(
+        "cm per pixel", value=0.02, min_value=0.0001, step=0.001, format="%.4f",
+        help="Known scale for your camera setup (e.g. derived once from a ruler photo).",
     )
-    if scale_mode.startswith("I know my cm"):
-        manual_cm_per_pixel = st.sidebar.number_input(
-            "cm per pixel", value=0.02, min_value=0.0001, step=0.001, format="%.4f",
-            help="Known scale for your camera setup (e.g. derived once from a ruler photo).",
-        )
-    else:
-        ref_width_cm = st.sidebar.number_input(
-            "Reference object width (cm)", value=8.56, min_value=0.01, step=0.1,
-            help="Real-world width of a reference object visible in the photo (e.g. a card).",
-        )
-        ref_width_px = st.sidebar.number_input(
-            "Reference object width in photo (px)", value=240.0, min_value=1.0, step=1.0,
-            help="How wide that same reference object measures in the photo, in pixels.",
-        )
 
 with st.sidebar.expander("Perspective rectification (optional)"):
     st.caption(
@@ -205,9 +166,7 @@ with st.sidebar.expander("Advanced settings"):
 def get_calibration(image):
     if not want_measurements:
         return calib.uncalibrated()
-    if scale_mode.startswith("I know my cm"):
-        return calib.manual_scale(manual_cm_per_pixel)
-    return calib.manual_reference(ref_width_cm, ref_width_px)
+    return calib.manual_scale(manual_cm_per_pixel)
 
 
 # ======================================================
