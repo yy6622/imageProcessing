@@ -17,24 +17,6 @@ try:
 except ImportError:
     YOLO_AVAILABLE = False
 
-try:
-    import torch  # noqa: F401  (only used to check availability up front)
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
-
-CNN_MODELS_DIR = "cnn_quality_models"
-try:
-    from train_cnn_quality import CLASS_FOLDERS as _CLASS_FOLDERS
-    CNN_FRUIT_TYPES = tuple(sorted({ftype for _, (ftype, _q) in _CLASS_FOLDERS.items()}))
-except Exception:
-    CNN_FRUIT_TYPES = ("Apple", "Banana", "Orange", "Mango", "Strawberry")
-_cnn_models_present = (
-    os.path.isdir(CNN_MODELS_DIR)
-    and any(os.path.isfile(os.path.join(CNN_MODELS_DIR, f"{ft}.pt")) for ft in CNN_FRUIT_TYPES)
-)
-CNN_AVAILABLE = _TORCH_AVAILABLE and _cnn_models_present
-
 st.set_page_config(page_title="Fruit Quality Inspection Dashboard", layout="wide")
 
 DEFAULT_ERODE_PIXELS = 10
@@ -457,17 +439,11 @@ if not YOLO_AVAILABLE:
         "Run `pip install ultralytics` and restart the app."
     )
 
-if not CNN_AVAILABLE:
-    if _TORCH_AVAILABLE:
-        st.sidebar.warning(
-            "No cnn_quality_models/*.pt found. Run `python train_cnn_quality.py` to train one per fruit type — "
-            "until then, Quality will show as unavailable."
-        )
-    else:
-        st.sidebar.warning(
-            "PyTorch not installed. Run `pip install torch torchvision`, then `python train_cnn_quality.py` — "
-            "until then, Quality will show as unavailable."
-        )
+if not os.path.isdir("color_knn_models"):
+    st.sidebar.warning(
+        "No color_knn_models/*.joblib found. Run `python train_color_knn.py` to train the colour-feature "
+        "KNN model per fruit type — until then, Quality will show as unavailable."
+    )
 
 st.sidebar.divider()
 want_measurements = st.sidebar.checkbox("Measure physical size (cm)", value=False)
@@ -668,9 +644,9 @@ if results:
                 cls = obj.get("classification")
 
                 cols[0].write(f"Type: **{obj.get('fruit_type') or 'N/A'}** "
-                               f"({obj.get('fruit_type_confidence', 0) * 100:.0f}%, YOLO)")
+                               f"({obj.get('fruit_type_confidence', 0) * 100:.0f}%)")
                 cols[1].write(f"Quality: **{obj.get('label') or 'N/A'}** "
-                               f"({obj.get('confidence', 0) * 100:.0f}%, CNN)")
+                               f"({obj.get('confidence', 0) * 100:.0f}%)")
                 if obj.get("width_cm") is not None:
                     cols[2].write(f"Size: {obj['width_cm']:.1f} × {obj['height_cm']:.1f} cm")
                     cols[3].write(f"Area: {obj['area_cm2']:.1f} cm²")

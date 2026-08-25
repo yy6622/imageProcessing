@@ -1,5 +1,3 @@
-
-
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -22,7 +20,7 @@ from calibration import CalibrationResult, uncalibrated
 
 DEFAULT_IMAGE_SIZE = (512, 512)
 
-FRUIT_DEBUG = os.environ.get("FRUIT_DEBUG", "0") not in ("0", "", "false", "False")
+FRUIT_DEBUG = os.environ.get("FRUIT_DEBUG", "0").lower() not in ("0", "", "false", "no", "off")
 
 
 def _dbg(*args):
@@ -122,47 +120,701 @@ def crop_object(image, detection: DetectionResult, pad_frac=0.06, isolate=False)
 class ClassificationResult:
     fruit_type: Optional[str] = None        # e.g. "Apple" / "Banana" / "Orange" — from YOLO's own label
     fruit_type_confidence: float = 0.0      # YOLO's box confidence
-    label: Optional[str] = None             # quality: Fresh / Unripe / Rotten — from the CNN
-    confidence: float = 0.0                 # CNN softmax score for the predicted quality label
-    quality_backend: str = "cnn"            # always "cnn" — kept as a field (rather than removed)
-    error: Optional[str] = None             # e.g. "No CNN quality model found for fruit type 'Apple'"
+    type_source: str = "YOLO"               # "YOLO" or "CNN override" -- which model actually produced fruit_type
+    label: Optional[str] = None             # quality: Fresh / Unripe / Rotten — PRIMARY result, from the
+                                             # Colour Feature Extraction KNN (train_color_knn.py)
+    confidence: float = 0.0                 # KNN's confidence for the predicted quality label
+    quality_backend: str = "color_knn"      # "color_knn" (primary) -- kept as a field for clarity
+    error: Optional[str] = None             # e.g. "No colour-feature model found for fruit type 'Apple'"
     defect_fraction: float = 0.0            # fraction of the fruit's OWN surface flagged as a dark
     defect_override: bool = False           # True if defect_fraction crossed the threshold and
 
 
-CNN_MODELS_DIR = "cnn_quality_models"
-_cnn_model_cache = {}
+COLOR_KNN_MODELS_DIR = "color_knn_models"
+_color_knn_model_cache = {}
 
 
-def _load_cnn_quality_model(fruit_type, models_dir=CNN_MODELS_DIR):
+def _load_color_knn_model(fruit_type, models_dir=COLOR_KNN_MODELS_DIR):
     key = (os.path.abspath(models_dir) if os.path.isdir(models_dir) else models_dir, fruit_type)
-    if key in _cnn_model_cache:
-        return _cnn_model_cache[key]
+    if key in _color_knn_model_cache:
+        return _color_knn_model_cache[key]
 
-    path = os.path.join(models_dir, f"{fruit_type}.pt")
+    path = os.path.join(models_dir, f"{fruit_type}.joblib")
     if not os.path.isfile(path):
-        _cnn_model_cache[key] = (None, None)
-        return None, None
+        _color_knn_model_cache[key] = (None, None, None)
+        return None, None, None
 
     try:
-        import train_cnn_quality as _cnn_module
-        model, classes = _cnn_module.load_cnn_model(path)
-    except Exception as e:  # missing torch, corrupt checkpoint, etc.
-        print(f"[colorDetection] CNN quality model at {path} unavailable ({e}); quality will be reported unavailable for '{fruit_type}'.")
-        _cnn_model_cache[key] = (None, None)
-        return None, None
+        import train_color_knn as _color_knn_module
+        scaler, model, classes = _color_knn_module.load_color_knn_model(path)
+    except Exception as e:  # missing joblib/sklearn, corrupt file, etc.
+        print(f"[colorDetection] Colour-feature KNN model at {path} unavailable ({e}); "
+              f"colour-based ripeness will be reported unavailable for '{fruit_type}'.")
+        _color_knn_model_cache[key] = (None, None, None)
+        return None, None, None
 
-    _cnn_model_cache[key] = (model, classes)
-    return model, classes
+    _color_knn_model_cache[key] = (scaler, model, classes)
+    return scaler, model, classes
 
 
-def classify_quality_cnn(crop_bgr, fruit_type, models_dir=CNN_MODELS_DIR):
-    model, classes = _load_cnn_quality_model(fruit_type, models_dir)
-    if model is None or crop_bgr is None or crop_bgr.size == 0:
+def classify_quality_color_knn(crop_bgr, fruit_type, models_dir=COLOR_KNN_MODELS_DIR):
+    """Colour Feature Extraction ripeness classifier: LAB+HSV colour moments -> KNN.
+    Independent of the CNN in train_cnn_quality.py -- uses only explicit colour
+    statistics, no raw pixels, shape, or texture."""
+    scaler, model, classes = _load_color_knn_model(fruit_type, models_dir)
+    if scaler is None or crop_bgr is None or crop_bgr.size == 0:
         return None, 0.0, {}
-    import train_cnn_quality as _cnn_module
-    prepared = _cnn_module.prepare_cnn_input_bgr(crop_bgr)
-    return _cnn_module.predict_quality_with_probs(model, classes, prepared)
+    import train_color_knn as _color_knn_module
+    return _color_knn_module.predict_ripeness_from_color(crop_bgr, scaler, model, classes)
+
+
+
+# ======================================================
+# Fruit-specific quality safety rules
+# ======================================================
+# These conservative rules supplement KNN. Every threshold may be tuned through
+# an environment variable after reviewing FRUIT_DEBUG logs on your own dataset.
+FRUIT_QUALITY_RULES = {
+    "Apple": {
+        "fresh_min": float(os.environ.get("APPLE_FRESH_COLOUR_MIN", "0.35")),
+        "fresh_max_unripe": float(os.environ.get("APPLE_FRESH_MAX_GREEN", "0.35")),
+        "unripe_min": float(os.environ.get("APPLE_UNRIPE_GREEN_MIN", "0.50")),
+        "unripe_max_ripe": float(os.environ.get("APPLE_UNRIPE_MAX_RIPE", "0.25")),
+        "rotten_defect": float(os.environ.get("APPLE_ROTTEN_DEFECT_MIN", "0.060")),
+        "brown_min": float(os.environ.get("APPLE_ROTTEN_BROWN_MIN", "0.025")),
+        "dark_min": float(os.environ.get("APPLE_ROTTEN_DARK_MIN", "0.012")),
+    },
+    "Orange": {
+        "fresh_min": float(os.environ.get("ORANGE_FRESH_ORANGE_MIN", "0.45")),
+        "fresh_max_unripe": float(os.environ.get("ORANGE_FRESH_MAX_GREEN", "0.25")),
+        "unripe_min": float(os.environ.get("ORANGE_UNRIPE_GREEN_MIN", "0.35")),
+        "unripe_max_ripe": float(os.environ.get("ORANGE_UNRIPE_MAX_ORANGE", "0.35")),
+        "rotten_defect": float(os.environ.get("ORANGE_ROTTEN_DEFECT_MIN", "0.070")),
+        "brown_min": float(os.environ.get("ORANGE_ROTTEN_BROWN_MIN", "0.050")),
+        "dark_min": float(os.environ.get("ORANGE_ROTTEN_DARK_MIN", "0.020")),
+    },
+    "Banana": {
+        "fresh_min": float(os.environ.get("BANANA_FRESH_YELLOW_MIN", "0.45")),
+        "fresh_max_unripe": float(os.environ.get("BANANA_FRESH_MAX_GREEN", "0.25")),
+        "unripe_min": float(os.environ.get("BANANA_UNRIPE_GREEN_MIN", "0.35")),
+        "unripe_max_ripe": float(os.environ.get("BANANA_UNRIPE_MAX_YELLOW", "0.30")),
+        "rotten_defect": float(os.environ.get("BANANA_ROTTEN_DEFECT_MIN", "0.055")),
+        "brown_min": float(os.environ.get("BANANA_ROTTEN_BROWN_MIN", "0.080")),
+        "dark_min": float(os.environ.get("BANANA_ROTTEN_DARK_MIN", "0.025")),
+    },
+    "Strawberry": {
+        "fresh_min": float(os.environ.get("STRAWBERRY_FRESH_RED_MIN", "0.45")),
+        "fresh_max_unripe": float(os.environ.get("STRAWBERRY_FRESH_MAX_PALE", "0.40")),
+        "unripe_min": float(os.environ.get("STRAWBERRY_UNRIPE_PALE_MIN", "0.45")),
+        "unripe_max_ripe": float(os.environ.get("STRAWBERRY_UNRIPE_MAX_RED", "0.28")),
+        "rotten_defect": float(os.environ.get("STRAWBERRY_ROTTEN_DEFECT_MIN", "0.070")),
+        "brown_min": float(os.environ.get("STRAWBERRY_ROTTEN_BROWN_MIN", "0.060")),
+        "dark_min": float(os.environ.get("STRAWBERRY_ROTTEN_DARK_MIN", "0.035")),
+    },
+    "Mango": {
+        # Direct Mango rule requested by the project:
+        # black -> Rotten, green -> Unripe, yellow/orange/red -> Fresh.
+        "fresh_min": float(os.environ.get("MANGO_FRESH_RIPE_COLOUR_MIN", "0.30")),
+        "fresh_max_unripe": float(os.environ.get("MANGO_FRESH_MAX_GREEN", "0.50")),
+        "unripe_min": float(os.environ.get("MANGO_UNRIPE_GREEN_MIN", "0.30")),
+        "unripe_max_ripe": float(os.environ.get("MANGO_UNRIPE_MAX_RIPE", "0.50")),
+        "rotten_defect": float(os.environ.get("MANGO_ROTTEN_DEFECT_MIN", "1.0")),
+        "brown_min": float(os.environ.get("MANGO_ROTTEN_BROWN_MIN", "1.0")),
+        "dark_min": float(os.environ.get("MANGO_ROTTEN_BLACK_MIN", "0.015")),
+    },
+}
+
+
+def _fraction(condition, denominator):
+    return float(np.count_nonzero(condition)) / max(1, int(denominator))
+
+
+def _fruit_surface_evidence(bgr, mask, fruit_type):
+    """Measure ripe, unripe, brown and dark surface colour for one fruit."""
+    foreground = mask > 0
+    foreground_count = int(foreground.sum())
+    empty = {
+        "ripe_fraction": 0.0, "unripe_fraction": 0.0,
+        "brown_dark_fraction": 0.0, "very_dark_fraction": 0.0,
+        "red_fraction": 0.0, "yellow_fraction": 0.0,
+        "green_fraction": 0.0, "pale_fraction": 0.0,
+    }
+    if foreground_count == 0:
+        return empty
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    colourful = saturation >= 45
+
+    red = foreground & colourful & ((hue < 12) | (hue >= 170)) & (value >= 55)
+    orange = (
+        foreground & (saturation >= 55)
+        & (hue >= 6) & (hue < 22) & (value >= 75)
+    )
+    yellow = (
+        foreground & (saturation >= 50)
+        & (hue >= 18) & (hue < 38) & (value >= 80)
+    )
+    green = (
+        foreground & (saturation >= 45)
+        & (hue >= 35) & (hue < 90) & (value >= 40)
+    )
+    pale = foreground & (
+        ((saturation < 85) & (value >= 115))
+        | ((hue >= 15) & (hue < 40) & (saturation < 155) & (value >= 105))
+    )
+
+    if fruit_type == "Banana":
+        brown_dark = (
+            foreground & (saturation >= 45)
+            & (hue >= 5) & (hue < 25) & (value < 135)
+        )
+    elif fruit_type == "Orange":
+        brown_dark = (
+            foreground & (saturation >= 45)
+            & (hue >= 5) & (hue < 20) & (value < 100)
+        )
+    elif fruit_type == "Strawberry":
+        # Do not count every naturally dark strawberry seed as decay.
+        brown_dark = (
+            foreground & (saturation >= 40)
+            & (hue >= 8) & (hue < 25) & (value < 105)
+        )
+    elif fruit_type == "Mango":
+        brown_dark = (
+            foreground & (saturation >= 40)
+            & (hue >= 7) & (hue < 24) & (value < 110)
+        )
+    else:
+        brown_dark = (
+            foreground & (saturation >= 55)
+            & (hue >= 8) & (hue < 23) & (value < 125)
+        )
+
+    very_dark = foreground & (value < 42)
+
+    reported_green = green
+    if fruit_type == "Apple":
+        ripe, unripe = red | yellow, green
+    elif fruit_type == "Orange":
+        ripe, unripe = orange | yellow, green
+    elif fruit_type == "Banana":
+        ripe, unripe = yellow, green
+    elif fruit_type == "Strawberry":
+        # A small green calyx is far below the conservative unripe threshold.
+        ripe, unripe = red, pale | green
+    elif fruit_type == "Mango":
+        # Green mango skin is often yellow-green (Hue 27..34), which the
+        # generic green range misses. Keep that range out of ripe yellow.
+        mango_green = (
+            foreground & (saturation >= 35)
+            & (hue >= 27) & (hue < 90) & (value >= 35)
+        )
+        mango_yellow_or_orange = (
+            foreground & (saturation >= 45)
+            & (hue >= 7) & (hue < 27) & (value >= 70)
+        )
+        ripe, unripe = red | mango_yellow_or_orange, mango_green
+        reported_green = mango_green
+    else:
+        ripe = unripe = np.zeros_like(foreground)
+
+    return {
+        "ripe_fraction": _fraction(ripe, foreground_count),
+        "unripe_fraction": _fraction(unripe, foreground_count),
+        "brown_dark_fraction": _fraction(brown_dark, foreground_count),
+        "very_dark_fraction": _fraction(very_dark, foreground_count),
+        "red_fraction": _fraction(red, foreground_count),
+        "yellow_fraction": _fraction(yellow, foreground_count),
+        "green_fraction": _fraction(reported_green, foreground_count),
+        "pale_fraction": _fraction(pale, foreground_count),
+    }
+
+
+def _conditional_probability(color_probs, label):
+    candidates = {
+        key: float(value) for key, value in color_probs.items()
+        if key != "Rotten"
+    }
+    total = sum(candidates.values())
+    return float(candidates.get(label, 0.0) / total) if total > 1e-9 else 0.0
+
+
+def _rule_confidence(label, evidence, rules, color_probs):
+    strength = (
+        evidence["ripe_fraction"] if label == "Fresh"
+        else evidence["unripe_fraction"]
+    )
+    threshold = rules["fresh_min"] if label == "Fresh" else rules["unripe_min"]
+    colour_confidence = np.clip(
+        0.55 + 0.35 * (strength - threshold) / max(1e-6, 1.0 - threshold),
+        0.55, 0.90,
+    )
+    return float(max(colour_confidence, _conditional_probability(color_probs, label)))
+
+
+def _best_non_rotten_quality(color_probs, evidence, rules):
+    strong_fresh = (
+        evidence["ripe_fraction"] >= rules["fresh_min"]
+        and evidence["unripe_fraction"] <= rules["fresh_max_unripe"]
+    )
+    strong_unripe = (
+        evidence["unripe_fraction"] >= rules["unripe_min"]
+        and evidence["ripe_fraction"] <= rules["unripe_max_ripe"]
+    )
+    if strong_fresh and not strong_unripe:
+        return "Fresh", _rule_confidence("Fresh", evidence, rules, color_probs)
+    if strong_unripe and not strong_fresh:
+        return "Unripe", _rule_confidence("Unripe", evidence, rules, color_probs)
+
+    candidates = {
+        label: float(probability) for label, probability in color_probs.items()
+        if label != "Rotten"
+    }
+    if not candidates:
+        return None, 0.0
+    label = max(candidates, key=candidates.get)
+    total = sum(candidates.values())
+    confidence = candidates[label] / total if total > 1e-9 else 0.0
+    return label, float(confidence)
+
+
+def _orange_mold_evidence(bgr, mask):
+    """Detect a connected white/gray mold patch with an optional green center."""
+    foreground_u8 = (mask > 0).astype(np.uint8)
+    foreground_count = int(foreground_u8.sum())
+    if foreground_count == 0:
+        return {
+            "white_gray_fraction": 0.0,
+            "mold_green_fraction": 0.0,
+            "largest_mold_fraction": 0.0,
+            "visible_mold": False,
+        }
+
+    # Ignore the contour boundary where white background commonly leaks in.
+    ys, xs = np.where(foreground_u8 > 0)
+    box_size = max(
+        int(ys.max()) - int(ys.min()) + 1,
+        int(xs.max()) - int(xs.min()) + 1,
+        1,
+    )
+    margin = max(2, int(round(box_size * 0.025)))
+    margin = min(margin, 11)
+    kernel_size = margin * 2 + 1
+    interior = cv2.erode(
+        foreground_u8 * 255,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        ),
+    ) > 0
+    if int(interior.sum()) < foreground_count * 0.35:
+        interior = foreground_u8 > 0
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+
+    # Exclude very bright specular highlights (V > 230). Mold in the supplied
+    # images is white/gray with moderate value and often has a dull green core.
+    white_gray = (
+        interior
+        & (saturation < 70)
+        & (value >= 80)
+        & (value <= 230)
+    )
+    mold_green = (
+        interior
+        & (hue >= 30)
+        & (hue <= 95)
+        & (saturation >= 18)
+        & (saturation <= 190)
+        & (value >= 45)
+        & (value <= 215)
+    )
+
+    candidate = ((white_gray | mold_green) * 255).astype(np.uint8)
+    candidate = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    candidate = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+    )
+
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        candidate, 8
+    )
+    largest_area = 0
+    for component in range(1, component_count):
+        largest_area = max(largest_area, int(stats[component, cv2.CC_STAT_AREA]))
+
+    white_fraction = float(white_gray.sum()) / foreground_count
+    green_fraction = float(mold_green.sum()) / foreground_count
+    largest_fraction = float(largest_area) / foreground_count
+    visible_mold = (
+        largest_fraction >= 0.080
+        and white_fraction >= 0.040
+        and (green_fraction >= 0.006 or white_fraction >= 0.140)
+    )
+    return {
+        "white_gray_fraction": white_fraction,
+        "mold_green_fraction": green_fraction,
+        "largest_mold_fraction": largest_fraction,
+        "visible_mold": bool(visible_mold),
+    }
+
+
+def _apply_quality_safety_rules(classification, color_probs, bgr, mask):
+    """Apply separate Apple/Orange/Banana/Strawberry/Mango quality rules."""
+    defect_fraction = detect_defect_fraction(bgr, mask)
+    classification.defect_fraction = defect_fraction
+    if classification.label is None:
+        return
+
+    fruit_type = classification.fruit_type
+    rules = FRUIT_QUALITY_RULES.get(fruit_type)
+    if rules is None:
+        if defect_fraction >= DEFAULT_DEFECT_AREA_FRACTION:
+            classification.label = "Rotten"
+            classification.defect_override = True
+        return
+
+    original_label = classification.label
+    evidence = _fruit_surface_evidence(bgr, mask, fruit_type)
+    roughness = compute_texture_roughness(bgr, mask)
+
+    if fruit_type == "Apple":
+        # Apple stems, calyxes and normal red/yellow patches often look like
+        # dark local defects. Rules must therefore never turn a KNN Fresh or
+        # Unripe apple into Rotten. They only validate/reject a KNN Rotten call.
+        apple_rotten_evidence = (
+            (
+                defect_fraction >= 0.100
+                and evidence["brown_dark_fraction"] >= 0.080
+            )
+            or (
+                defect_fraction >= 0.070
+                and evidence["brown_dark_fraction"] >= 0.050
+                and roughness >= 35.0
+            )
+            or (
+                defect_fraction >= 0.180
+                and evidence["brown_dark_fraction"] >= 0.030
+            )
+        )
+        # Pure yellow/yellow-green without meaningful red is treated as
+        # Unripe for this project's Apple labels. Red, or a true red+yellow
+        # bicolour surface, is Fresh.
+        apple_fresh_colour = (
+            evidence["red_fraction"] >= 0.30
+            or (
+                evidence["red_fraction"] >= 0.08
+                and evidence["yellow_fraction"] >= 0.08
+                and (
+                    evidence["red_fraction"] + evidence["yellow_fraction"]
+                    >= 0.30
+                )
+            )
+        )
+        apple_unripe_colour = (
+            evidence["red_fraction"] < 0.18
+            and (
+                evidence["green_fraction"] + evidence["yellow_fraction"]
+                >= 0.42
+            )
+        )
+        _dbg(
+            "Apple conservative quality rule:",
+            f"knn={original_label}",
+            f"ripe={evidence['ripe_fraction']:.4f}",
+            f"red={evidence['red_fraction']:.4f}",
+            f"yellow={evidence['yellow_fraction']:.4f}",
+            f"green={evidence['green_fraction']:.4f}",
+            f"brown={evidence['brown_dark_fraction']:.4f}",
+            f"defect={defect_fraction:.4f}",
+            f"roughness={roughness:.2f}",
+            f"rotten_evidence={apple_rotten_evidence}",
+            f"fresh_colour={apple_fresh_colour}",
+            f"unripe_colour={apple_unripe_colour}",
+        )
+
+        if original_label == "Rotten":
+            if not apple_rotten_evidence:
+                if apple_unripe_colour:
+                    replacement = "Unripe"
+                    confidence = _rule_confidence(
+                        "Unripe", evidence, rules, color_probs
+                    )
+                elif apple_fresh_colour:
+                    replacement = "Fresh"
+                    confidence = _rule_confidence(
+                        "Fresh", evidence, rules, color_probs
+                    )
+                else:
+                    replacement, confidence = _best_non_rotten_quality(
+                        color_probs, evidence, rules
+                    )
+                if replacement is not None:
+                    classification.label = replacement
+                    classification.confidence = confidence
+                    classification.defect_override = True
+            return
+
+        # Fresh <-> Unripe may still be corrected by a very clear surface
+        # colour, but Apple Rotten is never introduced by this rule.
+        if apple_unripe_colour and not apple_fresh_colour and original_label != "Unripe":
+            classification.label = "Unripe"
+            classification.confidence = _rule_confidence(
+                "Unripe", evidence, rules, color_probs
+            )
+            classification.defect_override = True
+        elif apple_fresh_colour and not apple_unripe_colour and original_label != "Fresh":
+            classification.label = "Fresh"
+            classification.confidence = _rule_confidence(
+                "Fresh", evidence, rules, color_probs
+            )
+            classification.defect_override = True
+        return
+
+    if fruit_type == "Orange":
+        # Dark orange caused by basket shadows is not decay. Like Apple, the
+        # Orange rule never changes a KNN Fresh/Unripe prediction to Rotten; it
+        # only decides whether an existing KNN Rotten call has enough evidence.
+        orange_fresh_colour = (
+            evidence["ripe_fraction"] >= 0.38
+            and evidence["green_fraction"] < 0.30
+        )
+        orange_unripe_colour = (
+            evidence["green_fraction"] >= 0.35
+            and evidence["ripe_fraction"] < 0.35
+        )
+        mold = _orange_mold_evidence(bgr, mask)
+        orange_rotten_evidence = mold["visible_mold"] or (
+            (
+                defect_fraction >= 0.120
+                and evidence["brown_dark_fraction"] >= 0.120
+                and roughness >= 32.0
+            )
+            or (
+                defect_fraction >= 0.200
+                and evidence["brown_dark_fraction"] >= 0.080
+            )
+            or (
+                defect_fraction >= 0.100
+                and evidence["brown_dark_fraction"] >= 0.180
+                and evidence["very_dark_fraction"] >= 0.025
+            )
+        )
+
+        _dbg(
+            "Orange conservative quality rule:",
+            f"knn={original_label}",
+            f"orange_yellow={evidence['ripe_fraction']:.4f}",
+            f"green={evidence['green_fraction']:.4f}",
+            f"brown={evidence['brown_dark_fraction']:.4f}",
+            f"dark={evidence['very_dark_fraction']:.4f}",
+            f"defect={defect_fraction:.4f}",
+            f"roughness={roughness:.2f}",
+            f"mold_white={mold['white_gray_fraction']:.4f}",
+            f"mold_green={mold['mold_green_fraction']:.4f}",
+            f"mold_largest={mold['largest_mold_fraction']:.4f}",
+            f"visible_mold={mold['visible_mold']}",
+            f"rotten_evidence={orange_rotten_evidence}",
+            f"fresh_colour={orange_fresh_colour}",
+            f"unripe_colour={orange_unripe_colour}",
+        )
+
+        if mold["visible_mold"]:
+            classification.label = "Rotten"
+            classification.confidence = float(max(
+                color_probs.get("Rotten", 0.0),
+                min(0.97, 0.70 + mold["largest_mold_fraction"]),
+            ))
+            classification.defect_override = original_label != "Rotten"
+            return
+
+        if original_label == "Rotten":
+            if not orange_rotten_evidence:
+                if orange_fresh_colour:
+                    replacement = "Fresh"
+                    confidence = _rule_confidence(
+                        "Fresh", evidence, rules, color_probs
+                    )
+                elif orange_unripe_colour:
+                    replacement = "Unripe"
+                    confidence = _rule_confidence(
+                        "Unripe", evidence, rules, color_probs
+                    )
+                else:
+                    replacement, confidence = _best_non_rotten_quality(
+                        color_probs, evidence, rules
+                    )
+                if replacement is not None:
+                    classification.label = replacement
+                    classification.confidence = confidence
+                    classification.defect_override = True
+            return
+
+        if orange_unripe_colour and not orange_fresh_colour and original_label != "Unripe":
+            classification.label = "Unripe"
+            classification.confidence = _rule_confidence(
+                "Unripe", evidence, rules, color_probs
+            )
+            classification.defect_override = True
+        elif orange_fresh_colour and not orange_unripe_colour and original_label != "Fresh":
+            classification.label = "Fresh"
+            classification.confidence = _rule_confidence(
+                "Fresh", evidence, rules, color_probs
+            )
+            classification.defect_override = True
+        return
+
+    if fruit_type == "Mango":
+        black_mango = evidence["very_dark_fraction"] >= rules["dark_min"]
+        green_mango = (
+            evidence["green_fraction"] >= rules["unripe_min"]
+            and evidence["green_fraction"] > evidence["ripe_fraction"]
+        )
+        yellow_orange_red_mango = (
+            evidence["ripe_fraction"] >= rules["fresh_min"]
+            and evidence["ripe_fraction"] >= evidence["green_fraction"]
+        )
+        _dbg(
+            "Mango direct colour rule:",
+            f"knn={original_label}",
+            f"black={evidence['very_dark_fraction']:.4f}",
+            f"green={evidence['green_fraction']:.4f}",
+            f"yellow_orange_red={evidence['ripe_fraction']:.4f}",
+            f"black_mango={black_mango}",
+            f"green_mango={green_mango}",
+            f"ripe_mango={yellow_orange_red_mango}",
+        )
+
+        if black_mango:
+            classification.label = "Rotten"
+            classification.confidence = float(max(
+                color_probs.get("Rotten", 0.0),
+                min(0.95, 0.60 + evidence["very_dark_fraction"] * 3.0),
+            ))
+            classification.defect_override = original_label != "Rotten"
+            return
+        if green_mango:
+            classification.label = "Unripe"
+            classification.confidence = _rule_confidence(
+                "Unripe", evidence, rules, color_probs
+            )
+            classification.defect_override = original_label != "Unripe"
+            return
+        if yellow_orange_red_mango:
+            classification.label = "Fresh"
+            classification.confidence = _rule_confidence(
+                "Fresh", evidence, rules, color_probs
+            )
+            classification.defect_override = original_label != "Fresh"
+            return
+
+        # Ambiguous colour may use KNN, but Rotten is never accepted without
+        # the black-surface condition above.
+        if original_label == "Rotten":
+            replacement, confidence = _best_non_rotten_quality(
+                color_probs, evidence, rules
+            )
+            if replacement is not None:
+                classification.label = replacement
+                classification.confidence = confidence
+                classification.defect_override = True
+        return
+
+    brown_lesion = (
+        evidence["brown_dark_fraction"] >= rules["brown_min"]
+        and defect_fraction >= 0.015
+    )
+    dark_lesion = (
+        evidence["very_dark_fraction"] >= rules["dark_min"]
+        and defect_fraction >= 0.010
+    )
+    large_brown_region = evidence["brown_dark_fraction"] >= max(
+        0.12, rules["brown_min"] * 2.5
+    )
+    texture_lesion = (
+        roughness >= 30.0
+        and defect_fraction >= 0.025
+        and evidence["brown_dark_fraction"] >= rules["brown_min"] * 0.35
+    )
+
+    # Protect normal red/yellow apple skin from false L-channel defect evidence.
+    normal_red_yellow_apple = (
+        fruit_type == "Apple"
+        and evidence["red_fraction"] >= 0.06
+        and evidence["yellow_fraction"] >= 0.06
+        and not (brown_lesion or dark_lesion or texture_lesion)
+    )
+    strong_defect = (
+        defect_fraction >= rules["rotten_defect"]
+        and not normal_red_yellow_apple
+    )
+    has_rotten_evidence = (
+        strong_defect or brown_lesion or dark_lesion
+        or large_brown_region or texture_lesion
+    )
+
+    strong_fresh = (
+        evidence["ripe_fraction"] >= rules["fresh_min"]
+        and evidence["unripe_fraction"] <= rules["fresh_max_unripe"]
+    )
+    strong_unripe = (
+        evidence["unripe_fraction"] >= rules["unripe_min"]
+        and evidence["ripe_fraction"] <= rules["unripe_max_ripe"]
+    )
+
+    _dbg(
+        f"{fruit_type} quality guard:",
+        f"knn={original_label}",
+        f"ripe={evidence['ripe_fraction']:.4f}",
+        f"unripe={evidence['unripe_fraction']:.4f}",
+        f"brown={evidence['brown_dark_fraction']:.4f}",
+        f"dark={evidence['very_dark_fraction']:.4f}",
+        f"defect={defect_fraction:.4f}",
+        f"roughness={roughness:.2f}",
+        f"rotten_evidence={has_rotten_evidence}",
+        f"strong_fresh={strong_fresh}",
+        f"strong_unripe={strong_unripe}",
+    )
+
+    if has_rotten_evidence:
+        classification.label = "Rotten"
+        classification.confidence = float(max(
+            color_probs.get("Rotten", 0.0),
+            min(0.95, 0.60 + defect_fraction * 2.0),
+        ))
+        classification.defect_override = original_label != "Rotten"
+        return
+
+    # A KNN Rotten label without local decay evidence is not accepted.
+    if original_label == "Rotten":
+        replacement, confidence = _best_non_rotten_quality(
+            color_probs, evidence, rules
+        )
+        if replacement is not None:
+            classification.label = replacement
+            classification.confidence = confidence
+            classification.defect_override = True
+        return
+
+    if strong_unripe and not strong_fresh and original_label != "Unripe":
+        classification.label = "Unripe"
+        classification.confidence = _rule_confidence(
+            "Unripe", evidence, rules, color_probs
+        )
+        classification.defect_override = True
+    elif strong_fresh and not strong_unripe and original_label != "Fresh":
+        classification.label = "Fresh"
+        classification.confidence = _rule_confidence(
+            "Fresh", evidence, rules, color_probs
+        )
+        classification.defect_override = True
 
 
 CNN_TYPE_MODELS_DIR = "cnn_type_models"
@@ -196,10 +848,10 @@ def classify_fruit_type_cnn(crop_bgr, models_dir=CNN_TYPE_MODELS_DIR):
     model, classes = _load_cnn_type_model(models_dir)
     if model is None or crop_bgr is None or crop_bgr.size == 0:
         return None, 0.0, {}
-    import train_cnn_quality as _cnn_module
     import train_fruit_type as _type_module
-    prepared = _cnn_module.prepare_cnn_input_bgr(crop_bgr)
-    return _type_module.predict_fruit_type_with_probs(model, classes, prepared)
+    # train_fruit_type owns its preprocessing. Passing the raw isolated crop
+    # avoids the old double-resize that destroyed Mango/Orange aspect ratio.
+    return _type_module.predict_fruit_type_with_probs(model, classes, crop_bgr)
 
 
 # ======================================================
@@ -333,9 +985,11 @@ def inspect_image_yolo(
                 probs_str = ", ".join(f"{k}={v:.3f}" for k, v in sorted(type_probs.items(), key=lambda kv: -kv[1]))
                 _dbg(f"main loop: type-CNN full breakdown: {probs_str}")
             fruit_type, fruit_type_confidence = yolo_species, yolo_conf
+            type_source = "YOLO"
 
             if type_label == "Strawberry" and type_conf >= STRAWBERRY_OVERRIDE_MIN_CONF:
                 fruit_type, fruit_type_confidence = type_label, type_conf
+                type_source = "CNN override"
                 _dbg(f"main loop: OVERRIDE {yolo_species}(conf={yolo_conf:.3f}) -> "
                      f"Strawberry(conf={type_conf:.3f})")
             elif type_label == "Mango" and type_conf >= MANGO_OVERRIDE_MIN_CONF_DOUBLE:
@@ -345,6 +999,7 @@ def inspect_image_yolo(
                 required_conf = MANGO_OVERRIDE_MIN_CONF_DOUBLE if both_ok else MANGO_OVERRIDE_MIN_CONF
                 if type_conf >= required_conf and (aspect_ok or roughness_ok):
                     fruit_type, fruit_type_confidence = type_label, type_conf
+                    type_source = "CNN override"
                     passed_via = "+".join(g for g, ok in (("aspect", aspect_ok), ("roughness", roughness_ok)) if ok)
                     _dbg(f"main loop: OVERRIDE {yolo_species}(conf={yolo_conf:.3f}) -> "
                          f"Mango(conf={type_conf:.3f}, aspect="
@@ -364,31 +1019,25 @@ def inspect_image_yolo(
                 _dbg(f"main loop: FINAL label={fruit_type} (YOLO conf={yolo_conf:.3f}) | "
                      f"type-CNN says {type_label} (conf={type_conf:.3f}) -- DISAGREES, not overridden")
 
-            classification = ClassificationResult(fruit_type=fruit_type, fruit_type_confidence=fruit_type_confidence)
-            cnn_label, cnn_conf, cnn_probs = classify_quality_cnn(raw_isolated_crop, fruit_type)
-            if cnn_label is not None:
-                classification.label = cnn_label
-                classification.confidence = cnn_conf
+            classification = ClassificationResult(fruit_type=fruit_type, fruit_type_confidence=fruit_type_confidence,
+                                                   type_source=type_source)
+            color_label, color_conf, color_probs = classify_quality_color_knn(raw_isolated_crop, fruit_type)
+            if color_label is not None:
+                classification.label = color_label
+                classification.confidence = color_conf
             else:
                 classification.error = (
-                    f"No CNN quality model found for fruit type '{fruit_type}' "
-                    f"(train one with train_cnn_quality.py, saved as {CNN_MODELS_DIR}/{fruit_type}.pt)"
+                    f"No colour-feature model found for fruit type '{fruit_type}' "
+                    f"(train one with train_color_knn.py, saved as {COLOR_KNN_MODELS_DIR}/{fruit_type}.joblib)"
                 )
 
+            if FRUIT_DEBUG and color_label is not None:
+                _dbg(f"main loop: colour-feature KNN says {color_label} (conf={color_conf:.3f})")
+
             denoised_only = prep.denoise(original, method=denoise_method)
-            defect_fraction = detect_defect_fraction(denoised_only, det.mask)
-            classification.defect_fraction = defect_fraction
-            if classification.label is not None:
-                if defect_fraction >= DEFAULT_DEFECT_AREA_FRACTION:
-                    classification.label = "Rotten"
-                    classification.defect_override = True
-                elif classification.label == "Rotten" and defect_fraction < DEFAULT_DEFECT_LOW_FRACTION:
-                    alt_candidates = {k: v for k, v in cnn_probs.items() if k != "Rotten"}
-                    if alt_candidates:
-                        alt_label = max(alt_candidates, key=alt_candidates.get)
-                        classification.label = alt_label
-                        classification.confidence = alt_candidates[alt_label]
-                        classification.defect_override = True
+            _apply_quality_safety_rules(
+                classification, color_probs, denoised_only, det.mask
+            )
 
             width_px, height_px = float(bw2), float(bh2)
             area_px = det.area_px
@@ -411,6 +1060,7 @@ def inspect_image_yolo(
                 "classification": classification,
                 "fruit_type": classification.fruit_type,
                 "fruit_type_confidence": classification.fruit_type_confidence,
+                "type_source": classification.type_source,
                 "label": classification.label,
                 "confidence": classification.confidence,
                 "defect_fraction": classification.defect_fraction,
@@ -468,31 +1118,25 @@ def inspect_image_yolo(
                      f"type-CNN={type_label}(conf={type_conf:.3f}) needs >= {required_conf}")
                 continue
 
-            classification = ClassificationResult(fruit_type=type_label, fruit_type_confidence=type_conf)
-            cnn_label, cnn_conf, cnn_probs = classify_quality_cnn(raw_isolated_crop, type_label)
-            if cnn_label is not None:
-                classification.label = cnn_label
-                classification.confidence = cnn_conf
+            classification = ClassificationResult(fruit_type=type_label, fruit_type_confidence=type_conf,
+                                                   type_source="CNN (fallback pass)")
+            color_label, color_conf, color_probs = classify_quality_color_knn(raw_isolated_crop, type_label)
+            if color_label is not None:
+                classification.label = color_label
+                classification.confidence = color_conf
             else:
                 classification.error = (
-                    f"No CNN quality model found for fruit type '{type_label}' "
-                    f"(train one with train_cnn_quality.py, saved as {CNN_MODELS_DIR}/{type_label}.pt)"
+                    f"No colour-feature model found for fruit type '{type_label}' "
+                    f"(train one with train_color_knn.py, saved as {COLOR_KNN_MODELS_DIR}/{type_label}.joblib)"
                 )
 
+            if FRUIT_DEBUG and color_label is not None:
+                _dbg(f"fallback: colour-feature KNN says {color_label} (conf={color_conf:.3f})")
+
             denoised_only = prep.denoise(original, method=denoise_method)
-            defect_fraction = detect_defect_fraction(denoised_only, det.mask)
-            classification.defect_fraction = defect_fraction
-            if classification.label is not None:
-                if defect_fraction >= DEFAULT_DEFECT_AREA_FRACTION:
-                    classification.label = "Rotten"
-                    classification.defect_override = True
-                elif classification.label == "Rotten" and defect_fraction < DEFAULT_DEFECT_LOW_FRACTION:
-                    alt_candidates = {k: v for k, v in cnn_probs.items() if k != "Rotten"}
-                    if alt_candidates:
-                        alt_label = max(alt_candidates, key=alt_candidates.get)
-                        classification.label = alt_label
-                        classification.confidence = alt_candidates[alt_label]
-                        classification.defect_override = True
+            _apply_quality_safety_rules(
+                classification, color_probs, denoised_only, det.mask
+            )
 
             width_px, height_px = float(bw3), float(bh3)
             area_px = det.area_px
@@ -515,6 +1159,7 @@ def inspect_image_yolo(
                 "classification": classification,
                 "fruit_type": classification.fruit_type,
                 "fruit_type_confidence": classification.fruit_type_confidence,
+                "type_source": classification.type_source,
                 "label": classification.label,
                 "confidence": classification.confidence,
                 "defect_fraction": classification.defect_fraction,
