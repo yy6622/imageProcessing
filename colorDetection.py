@@ -1,50 +1,4 @@
-"""
-colorDetection.py
-==============================================
-Inference / inspection pipeline for the fruit quality inspection
-system: detects + counts every fruit in a photo, identifies each
-one's TYPE (Apple/Banana/Orange), and classifies its QUALITY
-(Fresh/Unripe/Rotten).
 
-    Detection + fruit TYPE  — YOLOv8, pretrained on COCO. Apple/
-                              banana/orange are already 3 of its 80
-                              classes, so this needs zero extra
-                              training/labeling. Handles densely
-                              packed/overlapping fruit far better than
-                              a classical distance-transform/Hough/
-                              watershed splitter would.
-    Quality                 — a CNN (train_cnn_quality.py), one
-                              MobileNetV2 transfer-learning model per
-                              fruit type, looking at the WHOLE fruit
-                              at once rather than tiling it into
-                              patches and voting.
-
-Neither has a fallback to an older/classical approach — both were
-deliberate choices made after head-to-head testing (see README.md's
-"CNN quality classification" section for the full story, including a
-data-leakage bug found and fixed along the way). If ultralytics or a
-trained CNN model isn't available, this module reports that plainly
-(a load error, or a ClassificationResult.error message) rather than
-silently degrading to a weaker classical/SVM guess.
-
-This file previously also contained a patch+color-histogram SVM
-two-stage classifier (fruit type, then per-species quality) plus a
-classical distance-transform + Hough-assisted watershed splitter for
-separating touching fruit without an object detector — that code has
-been removed (not just disconnected) per an explicit decision to drop
-SVM entirely from this project. It's still recoverable from earlier
-version history if a report needs to reference/compare against it;
-segmentation.py's training functions for it are unaffected by
-this file's changes.
-
-Typical use (single image, full pipeline):
-
-    from colorDetection import inspect_image_yolo
-
-    result = inspect_image_yolo("sample.jpg", calibration=None)
-    for obj in result["objects"]:
-        print(obj["fruit_type"], obj["label"], obj["confidence"], obj["width_cm"])
-"""
 
 import os
 from dataclasses import dataclass
@@ -53,12 +7,27 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from segmentation import segmentation_mask_and_contour
+from segmentation import (
+    segmentation_mask_and_contour,
+    segment_all_objects,
+    detect_defect_fraction,
+    contour_shape_metrics,
+    compute_texture_roughness,
+    DEFAULT_DEFECT_AREA_FRACTION,
+    DEFAULT_DEFECT_LOW_FRACTION,
+)
 
 import preprocessing as prep
 from calibration import CalibrationResult, uncalibrated
 
 DEFAULT_IMAGE_SIZE = (512, 512)
+
+FRUIT_DEBUG = os.environ.get("FRUIT_DEBUG", "0") not in ("0", "", "false", "False")
+
+
+def _dbg(*args):
+    if FRUIT_DEBUG:
+        print("[FRUIT_DEBUG]", *args)
 
 
 # ======================================================
@@ -74,13 +43,35 @@ class DetectionResult:
     perimeter_px: float = 0.0
 
 
+DEDUPE_IOU_THRESHOLD = 0.5  # mask-overlap fraction above which two detections are treated as the same physical fruit
+
+
+def _dedupe_overlapping_detections(objects, iou_threshold=DEDUPE_IOU_THRESHOLD):
+    ranked = sorted(objects, key=lambda o: o["fruit_type_confidence"], reverse=True)
+    kept = []
+    for obj in ranked:
+        mask = obj["detection"].mask
+        is_dup = False
+        for kept_obj in kept:
+            kept_mask = kept_obj["detection"].mask
+            if mask is None or kept_mask is None:
+                continue
+            inter = int(np.logical_and(mask > 0, kept_mask > 0).sum())
+            union = int(np.logical_or(mask > 0, kept_mask > 0).sum())
+            iou = (inter / union) if union > 0 else 0.0
+            if iou > iou_threshold:
+                is_dup = True
+                _dbg(f"dedupe: DROP {obj.get('fruit_type')} (conf={obj['fruit_type_confidence']:.3f}) "
+                     f"-- overlaps {kept_obj.get('fruit_type')} (conf={kept_obj['fruit_type_confidence']:.3f}) "
+                     f"at IoU={iou:.2f}")
+                break
+        if not is_dup:
+            kept.append(obj)
+    kept.sort(key=lambda o: o["index"])
+    return kept
+
+
 def draw_detections(image, objects, box_color=(0, 255, 0), contour_color=(0, 165, 255)):
-    """
-    Returns a copy of `image` with every detected object's bounding box
-    + contour + a small "#N Type Quality" label drawn on it. `objects`
-    is the list of per-object dicts inspect_image_yolo() builds (each
-    with a "detection" DetectionResult, "index", "fruit_type", "label").
-    """
     annotated = image.copy()
     for obj in objects:
         detection = obj["detection"]
@@ -94,37 +85,16 @@ def draw_detections(image, objects, box_color=(0, 255, 0), contour_color=(0, 165
         quality = obj.get("label") or "?"
         text = f"#{obj['index'] + 1} {fruit_type} {quality}"
         text_y = max(y - 8, 15)
-        # Black outline + white fill so the label stays legible over any
-        # background color.
         cv2.putText(annotated, text, (x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(annotated, text, (x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
     return annotated
 
 
 CROP_EXTRA_ERODE_PIXELS = 6  # applied only to isolate=True crops, on top of
-                              # whatever erosion detection.mask already has —
-                              # a few extra pixels trims any faint blended
-                              # boundary/anti-aliasing ring that a classification
-                              # mask can tolerate but looks untidy in a crop
-                              # meant to be looked at directly by a person.
 
 
 def crop_object(image, detection: DetectionResult, pad_frac=0.06, isolate=False):
-    """
-    Returns a standalone crop of just this one detected fruit — "cut
-    out" of the full photo so it can be looked at (or saved/downloaded)
-    on its own, one fruit at a time, instead of only ever seeing it
-    embedded in the group photo with a bounding box drawn around it.
 
-    pad_frac: small margin added around the tight bounding box so the
-    crop doesn't slice right along the fruit's edge.
-    isolate: if True, also blacks out every pixel outside this fruit's
-    own contour (using detection.mask, eroded a few pixels further —
-    see CROP_EXTRA_ERODE_PIXELS) — useful when several fruits were
-    touching, so the crop shows ONLY this fruit, not slivers of its
-    neighbors that happened to fall inside the same bounding box, and
-    not a faint fringe of blended boundary pixels either.
-    """
     if not detection.found:
         return image.copy()
 
@@ -155,34 +125,16 @@ class ClassificationResult:
     label: Optional[str] = None             # quality: Fresh / Unripe / Rotten — from the CNN
     confidence: float = 0.0                 # CNN softmax score for the predicted quality label
     quality_backend: str = "cnn"            # always "cnn" — kept as a field (rather than removed)
-                                              # in case a second quality backend is ever added again.
     error: Optional[str] = None             # e.g. "No CNN quality model found for fruit type 'Apple'"
+    defect_fraction: float = 0.0            # fraction of the fruit's OWN surface flagged as a dark
+    defect_override: bool = False           # True if defect_fraction crossed the threshold and
 
 
-# ======================================================
-# CNN quality classification (see train_cnn_quality.py) — the ONLY
-# quality (Fresh/Unripe/Rotten) path this pipeline uses.
-# ======================================================
-# train_cnn_quality.py trains a CNN (MobileNetV2 transfer learning)
-# that looks at the WHOLE fruit at once, one model per fruit type, and
-# reached ~98% held-out accuracy — a real, measured improvement over an
-# earlier patch+majority-vote SVM approach's ~73% (that approach had a
-# confirmed structural blind spot: a small localized rotten spot gets
-# outvoted by the majority of an otherwise-normal-looking surface — a
-# synthetic dark spot covering up to 25% of a real Fresh apple never
-# flipped the vote to Rotten). If no cnn_quality_models/<FruitType>.pt
-# exists for a detected fruit type (or PyTorch isn't installed), that
-# object's quality is reported as unavailable with a clear
-# ClassificationResult.error message — there is no fallback.
 CNN_MODELS_DIR = "cnn_quality_models"
 _cnn_model_cache = {}
 
 
 def _load_cnn_quality_model(fruit_type, models_dir=CNN_MODELS_DIR):
-    """Lazily loads+caches the per-fruit-type CNN checkpoint. Returns
-    (model, classes) or (None, None) if the weights file doesn't exist
-    or PyTorch/train_cnn_quality can't be imported — callers report
-    quality as unavailable for that fruit type in that case."""
     key = (os.path.abspath(models_dir) if os.path.isdir(models_dir) else models_dir, fruit_type)
     if key in _cnn_model_cache:
         return _cnn_model_cache[key]
@@ -205,48 +157,88 @@ def _load_cnn_quality_model(fruit_type, models_dir=CNN_MODELS_DIR):
 
 
 def classify_quality_cnn(crop_bgr, fruit_type, models_dir=CNN_MODELS_DIR):
-    """
-    Classifies Fresh/Unripe/Rotten for one fruit crop with the CNN
-    (see train_cnn_quality.py). `crop_bgr` should be a plain
-    bounding-box crop of one fruit on its natural background (e.g.
-    crop_object(original, det, isolate=False)) — matches what the
-    CNN's training photos look like. Returns (label, confidence), or
-    (None, 0.0) if no CNN model is available for this fruit type.
-    """
     model, classes = _load_cnn_quality_model(fruit_type, models_dir)
     if model is None or crop_bgr is None or crop_bgr.size == 0:
-        return None, 0.0
+        return None, 0.0, {}
     import train_cnn_quality as _cnn_module
-    return _cnn_module.predict_quality(model, classes, crop_bgr)
+    prepared = _cnn_module.prepare_cnn_input_bgr(crop_bgr)
+    return _cnn_module.predict_quality_with_probs(model, classes, prepared)
+
+
+CNN_TYPE_MODELS_DIR = "cnn_type_models"
+_cnn_type_model_cache = {}
+
+
+def _load_cnn_type_model(models_dir=CNN_TYPE_MODELS_DIR):
+    key = os.path.abspath(models_dir) if os.path.isdir(models_dir) else models_dir
+    if key in _cnn_type_model_cache:
+        return _cnn_type_model_cache[key]
+
+    path = os.path.join(models_dir, "fruit_type.pt")
+    if not os.path.isfile(path):
+        _cnn_type_model_cache[key] = (None, None)
+        return None, None
+
+    try:
+        import train_fruit_type as _type_module
+        model, classes = _type_module.load_type_model(path)
+    except Exception as e:  # missing torch, corrupt checkpoint, etc.
+        print(f"[colorDetection] CNN fruit-type model at {path} unavailable ({e}); "
+              f"fallback (non-YOLO) fruit detection will be skipped.")
+        _cnn_type_model_cache[key] = (None, None)
+        return None, None
+
+    _cnn_type_model_cache[key] = (model, classes)
+    return model, classes
+
+
+def classify_fruit_type_cnn(crop_bgr, models_dir=CNN_TYPE_MODELS_DIR):
+    model, classes = _load_cnn_type_model(models_dir)
+    if model is None or crop_bgr is None or crop_bgr.size == 0:
+        return None, 0.0, {}
+    import train_cnn_quality as _cnn_module
+    import train_fruit_type as _type_module
+    prepared = _cnn_module.prepare_cnn_input_bgr(crop_bgr)
+    return _type_module.predict_fruit_type_with_probs(model, classes, prepared)
 
 
 # ======================================================
 # YOLO detection + fruit type
 # ======================================================
-# Which COCO class names count as "fruit" here — YOLO checkpoints
-# pretrained on COCO already include these three as distinct classes,
-# with zero labeling/training needed.
-YOLO_FRUIT_CLASS_NAMES = {"apple", "banana", "orange"}
-YOLO_CONFIDENCE_THRESHOLD = 0.25
+FALLBACK_ONLY_SPECIES = {"Mango", "Strawberry"}
+
+STRAWBERRY_OVERRIDE_MIN_CONF = 0.9   # every real strawberry test photo measured 1.000; no observed false positive at any confidence
+MANGO_OVERRIDE_MIN_CONF = 0.6        # lower than strawberry's bar on purpose -- this alone is NOT trusted; see MANGO_OVERRIDE_MIN_ASPECT, both must pass
+MANGO_OVERRIDE_MIN_ASPECT = 1.5      # local contour's long/short side ratio. Raised from 1.3 after a live
+MANGO_OVERRIDE_MAX_ROUGHNESS = 19.5  # compute_texture_roughness() (segmentation.py) -- mean Sobel gradient
+MANGO_OVERRIDE_MIN_CONF_DOUBLE = 0.5  # lower floor used ONLY when BOTH aspect_ok and roughness_ok pass --
+
+YOLO_FRUIT_CLASS_NAMES = {"apple", "banana", "orange", "mango", "strawberry"}
+YOLO_CONFIDENCE_THRESHOLD = 0.5
+
+DEFAULT_YOLO_WEIGHTS = "yolov8n.pt"
+FINE_TUNED_YOLO_WEIGHTS = os.path.join("yolo_fruit_models", "best.pt")
+
+
+def _resolve_yolo_weights(requested):
+    if requested == DEFAULT_YOLO_WEIGHTS and os.path.isfile(FINE_TUNED_YOLO_WEIGHTS):
+        return FINE_TUNED_YOLO_WEIGHTS
+    return requested
+
+
+FINE_TUNED_YOLO_IMGSZ = 416
+
 
 _yolo_model_cache = {}
 
 
 def _load_yolo_model(weights):
-    """Caches the loaded YOLO model per weights-path within a process,
-    so a Streamlit dashboard calling inspect_image_yolo() once per
-    uploaded photo doesn't reload (and re-download, on first use) the
-    model every single time."""
     if weights not in _yolo_model_cache:
         from ultralytics import YOLO
         _yolo_model_cache[weights] = YOLO(weights)
     return _yolo_model_cache[weights]
 
 
-# ======================================================
-# Full pipeline: preprocess -> YOLO detect+type -> local re-segment ->
-#                calibrate -> CNN classify quality
-# ======================================================
 def inspect_image_yolo(
     image_or_path,
     calibration: Optional[CalibrationResult] = None,
@@ -254,66 +246,9 @@ def inspect_image_yolo(
     denoise_method="median",
     enhance_method="clahe",
     erode_pixels=10,
-    yolo_weights="yolov8n.pt",
+    yolo_weights=DEFAULT_YOLO_WEIGHTS,
     yolo_confidence=YOLO_CONFIDENCE_THRESHOLD,
 ):
-    """
-    Runs the full inspection pipeline on one photo, which may contain
-    MULTIPLE fruits, and returns a plain dict (dashboard/report-friendly):
-
-        {
-          "original": np.ndarray,
-          "preprocessed": np.ndarray,
-          "annotated": np.ndarray,      # every object's bbox+contour+"#N Type Quality" label drawn
-          "objects": [
-              {
-                "index": int,
-                "detection": DetectionResult,
-                "bbox": (x, y, w, h),
-                "area_px"/"width_px"/"height_px": float,
-                "area_cm2"/"width_cm"/"height_cm": float | None,
-                "classification": ClassificationResult,
-                "fruit_type": str | None, "fruit_type_confidence": float,
-                "label": str | None,        # quality: Fresh/Unripe/Rotten
-                "confidence": float,
-                "crop": np.ndarray,          # this fruit cropped out of the original photo
-                "crop_isolated": np.ndarray, # same crop, background + neighboring fruits blacked out
-              }, ...
-          ],
-          "summary": {"Apple": {"Fresh": 2, "Rotten": 1}, "Orange": {"Fresh": 1}, ...},
-          "count": int,                 # total fruits detected in this photo
-          "calibration_method": str,
-          "calibration_confidence": str,
-        }
-
-    Detection + fruit TYPE come from a pretrained YOLO model (COCO
-    already includes apple/banana/orange, so no extra training/
-    labeling is needed) — this handles densely packed/heavily
-    overlapping same-species fruit meaningfully better than a
-    classical distance-transform/Hough/watershed splitter would, since
-    it recognizes "this looks like an apple" from learned visual
-    texture/shading rather than needing a clean geometric boundary
-    between touching objects.
-
-    Requires `pip install ultralytics` (imported lazily inside
-    _load_yolo_model(), not at module load time, so importing
-    colorDetection.py elsewhere doesn't require it unless this
-    function actually gets called).
-
-    Each YOLO box is re-segmented locally (segmentation_mask_and_
-    contour — LAB chroma-distance segmentation, imported from
-    segmentation.py) within just that box's crop, to get a
-    real contour/mask for measurements and for "crop_isolated" — the
-    box alone is just a rectangle, it doesn't say which pixels inside
-    it are this fruit vs. a sliver of its neighbor.
-
-    Quality (Fresh/Unripe/Rotten) comes entirely from the CNN via
-    classify_quality_cnn() (see train_cnn_quality.py) — YOLO has no
-    concept of ripeness, it only knows what a generic apple looks
-    like. No fallback: if no CNN model is trained for a detected
-    fruit's type, that object's quality comes back as unavailable with
-    an error message.
-    """
     if isinstance(image_or_path, str):
         original = cv2.imread(image_or_path)
         if original is None:
@@ -327,8 +262,10 @@ def inspect_image_yolo(
     if calibration is None:
         calibration = uncalibrated()
 
-    yolo_model = _load_yolo_model(yolo_weights)  # lazy-imports ultralytics; see that function
-    yolo_results = yolo_model.predict(original, conf=yolo_confidence, verbose=False)
+    resolved_weights = _resolve_yolo_weights(yolo_weights)
+    yolo_model = _load_yolo_model(resolved_weights)  # lazy-imports ultralytics; see that function
+    predict_imgsz = FINE_TUNED_YOLO_IMGSZ if resolved_weights == FINE_TUNED_YOLO_WEIGHTS else 640
+    yolo_results = yolo_model.predict(original, conf=yolo_confidence, imgsz=predict_imgsz, verbose=False)
 
     from collections import defaultdict
 
@@ -344,6 +281,8 @@ def inspect_image_yolo(
                 continue
             yolo_conf = float(box.conf[0])
             x1f, y1f, x2f, y2f = box.xyxy[0].tolist()
+            _dbg(f"main loop: YOLO box label={yolo_label} conf={yolo_conf:.3f} "
+                 f"xyxy=({x1f:.0f},{y1f:.0f},{x2f:.0f},{y2f:.0f})")
 
             h_img, w_img = original.shape[:2]
             pad = 0.08
@@ -355,20 +294,22 @@ def inspect_image_yolo(
             if x1 <= x0 or y1 <= y0:
                 continue
 
-            # Re-segment WITHIN just this box's crop to get a real
-            # contour/mask (the YOLO box is only a rectangle) — reliable
-            # once there's roughly one dominant fruit in frame, true
-            # almost by construction inside a tight YOLO box, even
-            # though it wasn't true for the whole photo.
             crop_for_seg = prep.preprocess_image(original[y0:y1, x0:x1], denoise_method=denoise_method, enhance_method="none")
             local_mask, local_contour = segmentation_mask_and_contour(crop_for_seg)
-            if local_contour is None:
-                # Fall back to the full box as the contour if local
-                # segmentation finds nothing usable (e.g. a very small
-                # or oddly-lit crop) — still better than dropping the
-                # detection entirely.
+            used_fallback_rect = local_contour is None
+            if used_fallback_rect:
                 local_contour = np.array([[[0, 0]], [[x1 - x0 - 1, 0]], [[x1 - x0 - 1, y1 - y0 - 1]], [[0, y1 - y0 - 1]]])
                 local_mask = np.full((y1 - y0, x1 - x0), 255, dtype=np.uint8)
+                local_aspect = None  # a synthetic rectangle's aspect isn't informative about the real object
+                local_circularity = None
+            else:
+                _local_solidity, local_aspect, local_circularity = contour_shape_metrics(local_contour)
+
+            local_roughness = compute_texture_roughness(crop_for_seg, local_mask)
+            _dbg(f"main loop: shape metrics aspect="
+                 f"{'n/a' if local_aspect is None else f'{local_aspect:.3f}'} "
+                 f"circularity={'n/a' if local_circularity is None else f'{local_circularity:.3f}'} "
+                 f"roughness={local_roughness:.1f}")
 
             contour = local_contour + [x0, y0]  # shift into full-image coordinates
             mask = np.zeros(original.shape[:2], dtype=np.uint8)
@@ -384,10 +325,47 @@ def inspect_image_yolo(
                 perimeter_px=float(cv2.arcLength(contour, closed=True)),
             )
 
-            fruit_type = yolo_label.capitalize()  # "apple" -> "Apple", matches train_cnn_quality.py's convention
+            raw_isolated_crop = crop_object(original, det, isolate=True)
 
-            classification = ClassificationResult(fruit_type=fruit_type, fruit_type_confidence=yolo_conf)
-            cnn_label, cnn_conf = classify_quality_cnn(crop_object(original, det, isolate=False), fruit_type)
+            yolo_species = yolo_label.capitalize()  # "apple" -> "Apple", matches train_cnn_quality.py's convention
+            type_label, type_conf, type_probs = classify_fruit_type_cnn(raw_isolated_crop)
+            if FRUIT_DEBUG and type_probs:
+                probs_str = ", ".join(f"{k}={v:.3f}" for k, v in sorted(type_probs.items(), key=lambda kv: -kv[1]))
+                _dbg(f"main loop: type-CNN full breakdown: {probs_str}")
+            fruit_type, fruit_type_confidence = yolo_species, yolo_conf
+
+            if type_label == "Strawberry" and type_conf >= STRAWBERRY_OVERRIDE_MIN_CONF:
+                fruit_type, fruit_type_confidence = type_label, type_conf
+                _dbg(f"main loop: OVERRIDE {yolo_species}(conf={yolo_conf:.3f}) -> "
+                     f"Strawberry(conf={type_conf:.3f})")
+            elif type_label == "Mango" and type_conf >= MANGO_OVERRIDE_MIN_CONF_DOUBLE:
+                aspect_ok = local_aspect is not None and local_aspect >= MANGO_OVERRIDE_MIN_ASPECT
+                roughness_ok = local_roughness <= MANGO_OVERRIDE_MAX_ROUGHNESS
+                both_ok = aspect_ok and roughness_ok
+                required_conf = MANGO_OVERRIDE_MIN_CONF_DOUBLE if both_ok else MANGO_OVERRIDE_MIN_CONF
+                if type_conf >= required_conf and (aspect_ok or roughness_ok):
+                    fruit_type, fruit_type_confidence = type_label, type_conf
+                    passed_via = "+".join(g for g, ok in (("aspect", aspect_ok), ("roughness", roughness_ok)) if ok)
+                    _dbg(f"main loop: OVERRIDE {yolo_species}(conf={yolo_conf:.3f}) -> "
+                         f"Mango(conf={type_conf:.3f}, aspect="
+                         f"{'n/a' if local_aspect is None else f'{local_aspect:.3f}'}, "
+                         f"roughness={local_roughness:.1f}, passed_via={passed_via}, "
+                         f"required_conf={required_conf})")
+                else:
+                    _dbg(f"main loop: Mango candidate REJECTED (shape+texture+conf gate) {yolo_species}(conf={yolo_conf:.3f}) "
+                         f"type-CNN=Mango(conf={type_conf:.3f}, needs >= {required_conf}) aspect="
+                         f"{'n/a' if local_aspect is None else f'{local_aspect:.3f}'} "
+                         f"(needs >= {MANGO_OVERRIDE_MIN_ASPECT}) roughness={local_roughness:.1f} "
+                         f"(needs <= {MANGO_OVERRIDE_MAX_ROUGHNESS})")
+
+            _already_logged_disagreement = type_label == "Mango" and type_conf >= MANGO_OVERRIDE_MIN_CONF_DOUBLE
+            if (FRUIT_DEBUG and type_label is not None and type_label != fruit_type
+                    and fruit_type == yolo_species and not _already_logged_disagreement):
+                _dbg(f"main loop: FINAL label={fruit_type} (YOLO conf={yolo_conf:.3f}) | "
+                     f"type-CNN says {type_label} (conf={type_conf:.3f}) -- DISAGREES, not overridden")
+
+            classification = ClassificationResult(fruit_type=fruit_type, fruit_type_confidence=fruit_type_confidence)
+            cnn_label, cnn_conf, cnn_probs = classify_quality_cnn(raw_isolated_crop, fruit_type)
             if cnn_label is not None:
                 classification.label = cnn_label
                 classification.confidence = cnn_conf
@@ -396,6 +374,21 @@ def inspect_image_yolo(
                     f"No CNN quality model found for fruit type '{fruit_type}' "
                     f"(train one with train_cnn_quality.py, saved as {CNN_MODELS_DIR}/{fruit_type}.pt)"
                 )
+
+            denoised_only = prep.denoise(original, method=denoise_method)
+            defect_fraction = detect_defect_fraction(denoised_only, det.mask)
+            classification.defect_fraction = defect_fraction
+            if classification.label is not None:
+                if defect_fraction >= DEFAULT_DEFECT_AREA_FRACTION:
+                    classification.label = "Rotten"
+                    classification.defect_override = True
+                elif classification.label == "Rotten" and defect_fraction < DEFAULT_DEFECT_LOW_FRACTION:
+                    alt_candidates = {k: v for k, v in cnn_probs.items() if k != "Rotten"}
+                    if alt_candidates:
+                        alt_label = max(alt_candidates, key=alt_candidates.get)
+                        classification.label = alt_label
+                        classification.confidence = alt_candidates[alt_label]
+                        classification.defect_override = True
 
             width_px, height_px = float(bw2), float(bh2)
             area_px = det.area_px
@@ -420,6 +413,8 @@ def inspect_image_yolo(
                 "fruit_type_confidence": classification.fruit_type_confidence,
                 "label": classification.label,
                 "confidence": classification.confidence,
+                "defect_fraction": classification.defect_fraction,
+                "defect_override": classification.defect_override,
                 "crop": crop_object(original, det, isolate=False),
                 "crop_isolated": crop_object(original, det, isolate=True),
             })
@@ -428,6 +423,118 @@ def inspect_image_yolo(
             quality_key = classification.label or "Unclassified"
             summary[fruit_key][quality_key] += 1
             i += 1
+
+    fallback_type_model, _fallback_type_classes = _load_cnn_type_model()
+    if fallback_type_model is not None:
+        for blob in segment_all_objects(original):
+            bx, by, bw3, bh3 = blob["bbox"]
+            cx, cy = bx + bw3 // 2, by + bh3 // 2
+
+            already_claimed = any(
+                obj["detection"].mask is not None
+                and 0 <= cy < obj["detection"].mask.shape[0]
+                and 0 <= cx < obj["detection"].mask.shape[1]
+                and obj["detection"].mask[cy, cx] > 0
+                for obj in objects
+            )
+            if already_claimed:
+                _dbg(f"fallback: SKIP (already_claimed by YOLO) bbox={blob['bbox']}")
+                continue
+
+            det = DetectionResult(
+                found=True, bbox=blob["bbox"], contour=blob["contour"], mask=blob["mask"],
+                area_px=blob["area_px"],
+                perimeter_px=float(cv2.arcLength(blob["contour"], closed=True)),
+            )
+
+            raw_isolated_crop = crop_object(original, det, isolate=True)
+            type_label, type_conf, type_probs = classify_fruit_type_cnn(raw_isolated_crop)
+            if FRUIT_DEBUG and type_probs:
+                probs_str = ", ".join(f"{k}={v:.3f}" for k, v in sorted(type_probs.items(), key=lambda kv: -kv[1]))
+                _dbg(f"fallback: type-CNN full breakdown: {probs_str}")
+
+            _blob_solidity, blob_aspect, blob_circularity = contour_shape_metrics(blob["contour"])
+            blob_roughness = compute_texture_roughness(prep.denoise(original, method=denoise_method), blob["mask"])
+            _dbg(f"fallback: bbox={blob['bbox']} type-CNN says {type_label} (conf={type_conf:.3f}) "
+                 f"aspect={blob_aspect:.3f} circularity={blob_circularity:.3f} roughness={blob_roughness:.1f}")
+            if type_label is None:
+                continue
+            if type_label not in FALLBACK_ONLY_SPECIES:
+                continue
+
+            required_conf = STRAWBERRY_OVERRIDE_MIN_CONF if type_label == "Strawberry" else MANGO_OVERRIDE_MIN_CONF
+            if type_conf < required_conf:
+                _dbg(f"fallback: REJECT (confidence floor) bbox={blob['bbox']} "
+                     f"type-CNN={type_label}(conf={type_conf:.3f}) needs >= {required_conf}")
+                continue
+
+            classification = ClassificationResult(fruit_type=type_label, fruit_type_confidence=type_conf)
+            cnn_label, cnn_conf, cnn_probs = classify_quality_cnn(raw_isolated_crop, type_label)
+            if cnn_label is not None:
+                classification.label = cnn_label
+                classification.confidence = cnn_conf
+            else:
+                classification.error = (
+                    f"No CNN quality model found for fruit type '{type_label}' "
+                    f"(train one with train_cnn_quality.py, saved as {CNN_MODELS_DIR}/{type_label}.pt)"
+                )
+
+            denoised_only = prep.denoise(original, method=denoise_method)
+            defect_fraction = detect_defect_fraction(denoised_only, det.mask)
+            classification.defect_fraction = defect_fraction
+            if classification.label is not None:
+                if defect_fraction >= DEFAULT_DEFECT_AREA_FRACTION:
+                    classification.label = "Rotten"
+                    classification.defect_override = True
+                elif classification.label == "Rotten" and defect_fraction < DEFAULT_DEFECT_LOW_FRACTION:
+                    alt_candidates = {k: v for k, v in cnn_probs.items() if k != "Rotten"}
+                    if alt_candidates:
+                        alt_label = max(alt_candidates, key=alt_candidates.get)
+                        classification.label = alt_label
+                        classification.confidence = alt_candidates[alt_label]
+                        classification.defect_override = True
+
+            width_px, height_px = float(bw3), float(bh3)
+            area_px = det.area_px
+            width_cm = height_cm = area_cm2 = None
+            if calibration.confidence != "uncalibrated":
+                width_cm = calibration.px_to_cm(width_px)
+                height_cm = calibration.px_to_cm(height_px)
+                area_cm2 = calibration.px_area_to_cm2(area_px)
+
+            objects.append({
+                "index": i,
+                "detection": det,
+                "bbox": det.bbox,
+                "area_px": area_px,
+                "width_px": width_px,
+                "height_px": height_px,
+                "area_cm2": area_cm2,
+                "width_cm": width_cm,
+                "height_cm": height_cm,
+                "classification": classification,
+                "fruit_type": classification.fruit_type,
+                "fruit_type_confidence": classification.fruit_type_confidence,
+                "label": classification.label,
+                "confidence": classification.confidence,
+                "defect_fraction": classification.defect_fraction,
+                "defect_override": classification.defect_override,
+                "crop": crop_object(original, det, isolate=False),
+                "crop_isolated": raw_isolated_crop,
+            })
+
+            fruit_key = classification.fruit_type or "Unknown"
+            quality_key = classification.label or "Unclassified"
+            summary[fruit_key][quality_key] += 1
+            i += 1
+
+    objects = _dedupe_overlapping_detections(objects)
+    summary = defaultdict(lambda: defaultdict(int))
+    for new_i, obj in enumerate(objects):
+        obj["index"] = new_i
+        fruit_key = obj["fruit_type"] or "Unknown"
+        quality_key = obj["label"] or "Unclassified"
+        summary[fruit_key][quality_key] += 1
 
     annotated = draw_detections(preprocessed, objects)
 

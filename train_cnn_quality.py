@@ -1,70 +1,3 @@
-"""
-train_cnn_quality.py
-==============================================
-CNN-based alternative to the patch-histogram + majority-vote quality
-classifier (Fresh / Unripe / Rotten), trained per fruit type.
-
-WHY THIS EXISTS
--------------------------------------------------------------
-Every feature-engineering idea tried this session on the existing
-patch-based SVM (more/fewer histogram bins, more texture bins,
-dropping the V channel, a "how far does this patch's hue stray from
-the fruit's own average hue" feature) landed at the same ~73% held-out
-accuracy for Apple Fresh/Rotten/Unripe — none moved the needle. The
-common thread: that architecture classifies each 32x32 patch on its
-own, then takes a majority vote across ~15-20 patches per fruit. When
-rot is a SMALL localized spot on an otherwise normal-looking apple,
-most patches genuinely still look Fresh, so majority vote reports
-Fresh even for a rotten apple — confirmed directly: adding a synthetic
-dark spot covering up to 25% of a real Fresh apple's surface never
-flipped the prediction to Rotten. No amount of per-patch feature
-tuning fixes that; it's a structural property of "vote per small tile,
-then average," not a feature quality problem.
-
-A CNN looks at the WHOLE fruit image at once (no tiling, no voting) —
-it can learn "this is mostly normal skin EXCEPT for one patch that
-looks wrong" directly, the same way a person would look at the whole
-apple rather than judging it tile-by-tile. This script trains one such
-CNN per fruit type (mirroring your existing quality_models[fruit_type]
-structure), using transfer learning from a small pretrained backbone
-(MobileNetV2) since your real, non-augmented training data is limited
-(seen directly this session: only 141-327 truly unique base photos per
-class after stripping out rotated/flipped/noise-augmented duplicates)
-— transfer learning is specifically suited to getting reasonable
-results from that little labeled data, rather than training a CNN from
-scratch (which typically wants thousands of unique images per class).
-
-SETUP (run on your own machine — NOT verified in this sandbox; see the
-note at the bottom of this docstring for why)
--------------------------------------------------------------
-    pip install torch torchvision
-
-USAGE
--------------------------------------------------------------
-    python train_cnn_quality.py --dataset dataset/train --out cnn_quality_models
-
-This trains one small model per fruit type found in CLASS_FOLDERS
-(Apple / Banana / Orange by default — edit CLASS_FOLDERS below if your
-folder names differ, same convention as segmentation.py) and
-saves each as cnn_quality_models/<FruitType>.pt.
-
-To classify a single already-cropped/segmented fruit image with a
-trained model:
-
-    from train_cnn_quality import load_cnn_model, predict_quality
-    model, classes = load_cnn_model("cnn_quality_models/Apple.pt")
-    label, confidence = predict_quality(model, classes, "some_apple_crop.jpg")
-
--------------------------------------------------------------
-NOTE ON THIS SCRIPT'S TESTING STATUS: PyTorch could not be installed
-in this session's sandbox — even installing from an already-downloaded
-~500MB wheel (skipping the network entirely) repeatedly timed out due
-to slow disk I/O in this particular environment, the same issue hit
-when setting up the YOLO integration earlier. This script is written
-and ready to run, but has not been executed end-to-end here. Run it on
-your own machine and share the printed accuracy numbers + any errors —
-happy to debug from real output rather than guessing.
-"""
 
 import argparse
 import glob
@@ -72,29 +5,46 @@ import os
 import random
 import re
 
-# Mirrors segmentation.CLASS_FOLDERS — edit if your dataset
-# folder names differ. Reusing the same convention keeps this script
-# drop-in compatible with the dataset you already have.
 CLASS_FOLDERS = {
-    "freshapples":   ("Apple", "Fresh"),
-    "rottenapples":  ("Apple", "Rotten"),
-    "unripe apple":  ("Apple", "Unripe"),
-    "freshbanana":   ("Banana", "Fresh"),
-    "rottenbanana":  ("Banana", "Rotten"),
-    "unripe banana": ("Banana", "Unripe"),
-    "freshoranges":  ("Orange", "Fresh"),
-    "rottenoranges": ("Orange", "Rotten"),
-    "unripe orange": ("Orange", "Unripe"),
+    "freshapples":       ("Apple", "Fresh"),
+    "rottenapples":      ("Apple", "Rotten"),
+    "unripe apple":      ("Apple", "Unripe"),
+    "freshbanana":       ("Banana", "Fresh"),
+    "rottenbanana":      ("Banana", "Rotten"),
+    "unripe banana":     ("Banana", "Unripe"),
+    "freshoranges":      ("Orange", "Fresh"),
+    "rottenoranges":     ("Orange", "Rotten"),
+    "unripe orange":     ("Orange", "Unripe"),
+    "ripemango":         ("Mango", "Fresh"),
+    "rottonmango":       ("Mango", "Rotten"),
+    "unripemango":       ("Mango", "Unripe"),
+    "FreshStrawberry":   ("Strawberry", "Fresh"),
+    "RottenStrawberry":  ("Strawberry", "Rotten"),
+    "unripe strawberry": ("Strawberry", "Unripe"),
 }
 
 IMAGE_SIZE = 160          # CNN input resolution — MobileNetV2's native
-                           # size is 224, but 160 trains noticeably
-                           # faster on CPU and transfer learning tolerates
-                           # the downscale fine for this task.
 BATCH_SIZE = 16
 EPOCHS = 15
 LEARNING_RATE = 1e-4
 VAL_SPLIT = 0.2
+
+TRAIN_DENOISE_METHOD = "median"
+TRAIN_ENHANCE_METHOD = "clahe"
+
+
+def prepare_cnn_input_bgr(raw_bgr, denoise_method=TRAIN_DENOISE_METHOD, enhance_method=TRAIN_ENHANCE_METHOD, mask_background=True):
+    import cv2
+    import preprocessing as prep
+    from segmentation import segmentation_mask_and_contour
+
+    bgr = cv2.resize(raw_bgr, (IMAGE_SIZE, IMAGE_SIZE))
+    bgr = prep.preprocess_image(bgr, denoise_method=denoise_method, enhance_method=enhance_method)
+    if mask_background:
+        mask, contour = segmentation_mask_and_contour(bgr)
+        if contour is not None:
+            bgr = cv2.bitwise_and(bgr, bgr, mask=mask)
+    return bgr
 
 
 _AUG_PREFIX_RE = re.compile(
@@ -104,24 +54,6 @@ _AUG_PREFIX_RE = re.compile(
 
 
 def _base_image_key(path):
-    """
-    Strips known augmentation-prefix patterns (rotated_by_15_,
-    translation_, saltandpepper_, vertical_flip_, aug_, ...) from a
-    filename to recover an identifier for the ORIGINAL source photo.
-    Multiple augmented copies of the same photo collapse to the same
-    key, so a grouped train/val split (see _group_split) can keep every
-    copy of one photo on the SAME side of the split.
-
-    Why this matters: this dataset's file counts are mostly augmented
-    duplicates of a much smaller set of real photos (confirmed earlier
-    this session — e.g. only ~141-327 truly unique photos per class
-    despite 1000-2300+ files). Splitting by FILE instead of by ORIGINAL
-    PHOTO lets a rotated/flipped/noised copy of a training image leak
-    into validation — the model has effectively already seen a
-    near-duplicate of that "unseen" validation image during training.
-    That's exactly what produced the first run's suspicious 99%+
-    validation accuracy: it wasn't measuring real generalization.
-    """
     name = os.path.basename(path)
     stem, _ext = os.path.splitext(name)
     prev = None
@@ -132,12 +64,6 @@ def _base_image_key(path):
 
 
 def _group_split(dataset, val_frac, seed=42):
-    """
-    Splits `dataset.samples` into (train_indices, val_indices) grouped
-    by base-image key so every augmented copy of one original photo
-    ends up on the same side of the split. Returns two lists of
-    integer indices into `dataset.samples`.
-    """
     groups = {}
     for idx, (_path, _label, key) in enumerate(dataset.samples):
         groups.setdefault(key, []).append(idx)
@@ -163,16 +89,6 @@ def _group_split(dataset, val_frac, seed=42):
 
 
 def _build_model(num_classes):
-    """
-    MobileNetV2 pretrained on ImageNet, with its classifier head
-    replaced for our 2-3 quality classes and everything BEFORE the
-    last few layers frozen. Freezing the early layers is the standard
-    transfer-learning move when labeled data is limited (as it
-    genuinely is here) — those layers already encode generic edge/
-    texture/color features useful for almost any image task; only the
-    later, more task-specific layers need retraining on your fruit
-    photos.
-    """
     import torch.nn as nn
     from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 
@@ -196,9 +112,12 @@ def _build_transforms(train: bool):
             transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(20),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+            transforms.RandomGrayscale(p=0.15),
+            transforms.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.3, hue=0.06),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.85, 1.15), shear=5),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.08)),
         ])
     return transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -208,17 +127,8 @@ def _build_transforms(train: bool):
 
 
 class FruitQualityDataset:
-    """Loads (image_path, quality_label, base_image_key) triples for ONE
-    fruit type from the dataset folder structure, matching CLASS_FOLDERS."""
 
     def __init__(self, dataset_dir, fruit_type, transform=None):
-        # NOTE: deliberately NOT storing the PIL Image module (or any
-        # module object) as an instance attribute. On Windows,
-        # DataLoader(num_workers>0) pickles the whole Dataset object to
-        # send it to worker processes (spawn start method) — modules
-        # aren't picklable, which is exactly what caused
-        # "TypeError: cannot pickle 'module' object". Importing PIL
-        # fresh inside __getitem__ instead avoids that entirely.
         self.transform = transform
         self.samples = []
         self.classes = sorted({
@@ -246,9 +156,25 @@ class FruitQualityDataset:
         return len(self.samples)
 
     def __getitem__(self, idx):
+        import cv2
+        import numpy as np
         from PIL import Image
+
         path, label, _key = self.samples[idx]
-        image = Image.open(path).convert("RGB")
+        bgr = cv2.imread(path)
+        if bgr is None:
+            try:
+                pil_fallback = Image.open(path).convert("RGB")
+                bgr = np.array(pil_fallback)[:, :, ::-1].copy()
+            except (FileNotFoundError, OSError) as exc:
+                print(f"[WARN] Skipping unreadable training image: {path} ({exc})")
+                fallback_idx = (idx + 1) % len(self.samples)
+                return self.__getitem__(fallback_idx)
+
+        bgr = prepare_cnn_input_bgr(bgr)
+
+        image = Image.fromarray(bgr[:, :, ::-1])  # BGR -> RGB
+
         if self.transform:
             image = self.transform(image)
         return image, label
@@ -271,27 +197,12 @@ def train_fruit_type_model(dataset_dir, fruit_type, epochs=EPOCHS, batch_size=BA
     classes = full_dataset.classes
     print(f"[INFO] {fruit_type}: {len(full_dataset)} images, classes={classes}")
 
-    # Grouped by original-photo identity (see _base_image_key /
-    # _group_split docstrings) so augmented copies of one training
-    # photo can't leak into validation — a plain random file-level
-    # split let that happen on the first run of this script and
-    # produced a fake 99%+ validation accuracy.
     train_indices, val_indices = _group_split(full_dataset, VAL_SPLIT, seed=42)
 
-    # Validation set should NOT get the training-time augmentation
-    # (random flips/rotation/jitter) — build it from a separately
-    # instantiated dataset with the plain eval transform, using the
-    # SAME file ordering (paths are sorted in __init__) so indices
-    # line up with train_indices/val_indices above.
     eval_dataset = FruitQualityDataset(dataset_dir, fruit_type, transform=_build_transforms(train=False))
     train_ds = Subset(full_dataset, train_indices)
     val_ds = Subset(eval_dataset, val_indices)
 
-    # num_workers=0 (load in the main process) rather than >0: on
-    # Windows, DataLoader workers are separate processes (spawn start
-    # method, no fork), which adds real pickling fragility for not
-    # much speed gain on a dataset this size — simplicity over a small
-    # possible speedup here.
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -356,11 +267,7 @@ def load_cnn_model(path):
     return model, classes
 
 
-def predict_quality(model, classes, image_or_path):
-    """
-    image_or_path: a file path, a PIL Image, or a BGR numpy array
-    (OpenCV convention — auto-converted to RGB). Returns (label, confidence).
-    """
+def _predict_quality_impl(model, classes, image_or_path):
     import torch
     import numpy as np
     from PIL import Image
@@ -379,7 +286,17 @@ def predict_quality(model, classes, image_or_path):
         logits = model(tensor)
         probs = torch.softmax(logits, dim=1)[0]
         idx = int(probs.argmax())
-        return classes[idx], float(probs[idx])
+        probs_dict = {classes[i]: float(probs[i]) for i in range(len(classes))}
+        return classes[idx], float(probs[idx]), probs_dict
+
+
+def predict_quality(model, classes, image_or_path):
+    label, confidence, _probs = _predict_quality_impl(model, classes, image_or_path)
+    return label, confidence
+
+
+def predict_quality_with_probs(model, classes, image_or_path):
+    return _predict_quality_impl(model, classes, image_or_path)
 
 
 def main():

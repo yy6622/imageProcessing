@@ -1,26 +1,3 @@
-"""
-report.py
-==============================================
-Automated PDF export of batch inspection results.
-
-Satisfies the assignment's extra-effort requirement:
-    "Reporting: Automated export of results and findings into PDF
-     format."
-
-Takes the list of per-image result dicts produced by
-colorDetection.inspect_image() (as assembled by app.py across a batch
-upload) and renders a PDF with:
-    - a title page / run summary (counts per fruit type / quality
-      across every detected fruit, average size, calibration status)
-    - a bar chart of fruit-type and quality distribution
-    - one section per image: annotated (every fruit's bbox+contour)
-      thumbnail, plus a per-fruit table (type, quality, confidence,
-      measurements) for every fruit detected in that photo
-
-Uses reportlab (pure-Python, no external binary dependency) so it runs
-anywhere the rest of the pipeline runs, including inside the Streamlit
-app's sandbox.
-"""
 
 import io
 from collections import Counter
@@ -41,8 +18,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 
 def _cv2_to_reportlab_image(bgr_image, max_width_cm=8.0):
-    """Encodes a BGR numpy image as PNG bytes and wraps it in a
-    reportlab Image flowable sized to fit the page."""
     success, buf = cv2.imencode(".png", bgr_image)
     if not success:
         return None
@@ -54,8 +29,6 @@ def _cv2_to_reportlab_image(bgr_image, max_width_cm=8.0):
 
 
 def _distribution_chart(labels, title, color_map=None):
-    """Returns a reportlab Image flowable containing a bar chart of
-    label counts, or None if there's nothing to plot."""
     counts = Counter(l for l in labels if l)
     if not counts:
         return None
@@ -80,23 +53,6 @@ def _distribution_chart(labels, title, color_map=None):
 
 
 def generate_report(results, output_path="inspection_report.pdf", batch_name="Fruit Quality Inspection"):
-    """
-    results: list of dicts, each the return value of
-        colorDetection.inspect_image() plus a "filename" key. Key
-        fields used here:
-        "filename": str
-        "objects": list of per-fruit dicts (index, fruit_type,
-            fruit_type_confidence, label, confidence, width_cm/
-            height_cm/area_cm2 or *_px fallback)
-        "summary": {"Apple": {"Fresh": 2, "Rotten": 1}, ...}
-        "count": int, number of fruit detected in this image
-        "annotated": np.ndarray (BGR image with every fruit's
-            bbox/contour drawn)
-        "calibration_method": str
-    output_path: where to write the PDF.
-
-    Returns output_path.
-    """
     styles = getSampleStyleSheet()
     title_style = styles["Title"]
     heading_style = styles["Heading2"]
@@ -106,7 +62,6 @@ def generate_report(results, output_path="inspection_report.pdf", batch_name="Fr
     doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
     story = []
 
-    # ---- Title / summary page ----
     story.append(Paragraph(batch_name, title_style))
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", small_style))
     story.append(Spacer(1, 0.5 * cm))
@@ -162,7 +117,6 @@ def generate_report(results, output_path="inspection_report.pdf", batch_name="Fr
 
     story.append(PageBreak())
 
-    # ---- Per-image sections ----
     for i, r in enumerate(results, start=1):
         objects = r.get("objects", [])
         count = r.get("count", len(objects))
@@ -180,9 +134,6 @@ def generate_report(results, output_path="inspection_report.pdf", batch_name="Fr
                 story.append(img_flowable)
         story.append(Spacer(1, 0.3 * cm))
 
-        # Each fruit cropped out on its own (background + neighboring
-        # fruit removed via its mask) — the "separated" view, next to
-        # the whole-photo annotated image above.
         crops = [obj.get("crop_isolated") for obj in objects if obj.get("crop_isolated") is not None]
         if crops:
             cell_w = min(4.0 * cm, 16.0 * cm / max(1, len(crops)))

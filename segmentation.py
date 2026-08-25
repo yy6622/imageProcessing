@@ -1,81 +1,30 @@
-"""
-segmentation.py
-==============================================
-LAB chroma-distance background segmentation — the one piece of this
-project's original classical-CV pipeline that's still an active,
-live dependency. `colorDetection.py`'s `inspect_image_yolo()` imports
-`segmentation_mask_and_contour()` directly, to re-segment the crop
-inside each YOLO detection box (getting a real contour/mask, since a
-YOLO box is just a rectangle).
 
-Everything else that used to live in this file has been deleted
-entirely, not just disconnected, per an explicit decision to keep only
-code that's actually called by something:
-  - The SVM/RandomForest/KNN classifier training pipeline
-    (build_dataset(), build_model()/train_model()/
-    train_hierarchical_model()/compare_models(), VotingEnsemble,
-    evaluate_majority_vote(), every save_*/load_* model function, the
-    CLI) — superseded by YOLOv8 (detection + fruit type) and a CNN
-    (train_cnn_quality.py, quality); see colorDetection.py's and
-    app.py's module docstrings for that story.
-  - The classical multi-fruit detection/splitting algorithms
-    (find_object_instances(), the distance-transform + Hough-assisted
-    watershed splitter, debris/leaf filtering) — superseded by YOLO's
-    own detector, which separates individual fruit without needing any
-    of this.
-  - The shape/color-histogram/color-moment/LBP-texture feature
-    extractors (extract_shape_features(), extract_color_histogram(),
-    extract_color_moments(), extract_texture_histogram(),
-    extract_patch_feature()) — those fed the SVM classifiers above;
-    the CNN learns directly from raw image crops instead and never
-    needed them.
-None of that is recoverable from this file anymore — it's genuinely
-gone, not hidden/disabled. If a report ever needs to reference the
-original classical-CV approach (watershed splitting, hand-engineered
-features, etc.), that needs pulling from an earlier saved version of
-this project rather than from the current file.
-==============================================
-"""
+
+import os
 
 import cv2
 import numpy as np
 
-# segmentation_mask_and_contour()'s parameters — see its docstring for
-# why chroma distance (not a fixed HSV threshold) is used.
+FRUIT_DEBUG = os.environ.get("FRUIT_DEBUG", "0") not in ("0", "", "false", "False")
+
+
+def _dbg(*args):
+    if FRUIT_DEBUG:
+        print("[FRUIT_DEBUG]", *args)
+
+
 SEGMENTATION_CHROMA_THRESHOLD = 15.0   # min LAB a/b distance from background to count as foreground
 SEGMENTATION_BORDER_FRAC = 0.04        # fraction of each edge sampled to estimate background color
+
+SEGMENTATION_CLOSE_KSIZE = 9
+SEGMENTATION_OPEN_KSIZE = 5
 
 
 # ======================================================
 # segment_fruit — background removal
 # ======================================================
 def estimate_background_chroma(image, border_frac=SEGMENTATION_BORDER_FRAC):
-    """
-    Samples a strip along all 4 edges of the image and estimates the
-    background's (a, b) chroma in LAB space from it.
 
-    Uses the MODE of the border pixels' (a, b) values (the densest
-    cluster in a coarse 2D histogram), not the median — confirmed
-    necessary directly on a real photo where the fruit was packed
-    edge-to-edge, touching or nearly touching all 4 sides of the frame
-    (a tray of apples filling the whole shot, only a sliver of the true
-    blue tray visible in a couple of corners). When most of the border
-    strip is actually fruit rather than background, the MEDIAN gets
-    dragged toward the fruit's own color — measured directly: median
-    landed at LAB b=178 on a synthetic reproduction of that photo,
-    nowhere near the true background's b=89 — corrupting the "what
-    does background look like" estimate the whole segmentation pipeline
-    depends on, so it started keeping fruit pixels OUT of the mask
-    (mistaking them for background) almost everywhere except the few
-    spots that still looked different enough from that wrong estimate.
-    The MODE is far more robust to this: even when true background
-    pixels are a minority of the border, they form one small, consistent
-    color cluster, while the contaminating fruit pixels (varied red/
-    green apple hues, highlights, shadow) are comparatively spread out
-    and don't win any single histogram bin — confirmed on the same
-    synthetic reproduction: mode-based estimate landed at (117, 87),
-    within a few units of the true (121, 89), vs. the median's (121, 178).
-    """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
     h, w = image.shape[:2]
     bh = max(1, int(h * border_frac))
@@ -93,18 +42,6 @@ def estimate_background_chroma(image, border_frac=SEGMENTATION_BORDER_FRAC):
     hist, a_edges, b_edges = np.histogram2d(a_vals, b_vals, bins=25, range=[[0, 255], [0, 255]])
     idx = np.unravel_index(np.argmax(hist), hist.shape)
 
-    # The mode bin only narrows down roughly WHERE the background
-    # cluster is (each bin spans ~10 units of a/b) — precise enough to
-    # ignore a large contaminating minority (fruit pixels along the
-    # border), but too coarse to use as the final answer on its own,
-    # since it would round every estimate to one of 25 fixed positions
-    # regardless of the border's actual pixel values. Confirmed this
-    # mattered directly: using the raw bin center regressed several
-    # already-verified plain-background test photos that used to split
-    # correctly. Refining by taking the median of just the border
-    # pixels that FELL INTO the winning bin recovers the same precision
-    # the old median-of-everything approach had, while keeping the
-    # contamination-resistance the histogram mode step provides.
     in_bin = (
         (a_vals >= a_edges[idx[0]]) & (a_vals < a_edges[idx[0] + 1] + 1e-6) &
         (b_vals >= b_edges[idx[1]]) & (b_vals < b_edges[idx[1] + 1] + 1e-6)
@@ -118,19 +55,24 @@ def estimate_background_chroma(image, border_frac=SEGMENTATION_BORDER_FRAC):
     return bg_a, bg_b
 
 
+LEAF_HUE_RANGE = (35, 85)      # OpenCV hue (0-179 scale)
+LEAF_MIN_SATURATION = 70
+LEAF_MIN_VALUE = 40
+
+
+def _leaf_green_mask(image):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    lo, hi = LEAF_HUE_RANGE
+    return (h >= lo) & (h <= hi) & (s >= LEAF_MIN_SATURATION) & (v >= LEAF_MIN_VALUE)
+
+
 def _foreground_contours(
     image,
     chroma_threshold=SEGMENTATION_CHROMA_THRESHOLD,
     border_frac=SEGMENTATION_BORDER_FRAC,
+    exclude_leaf_green=False,
 ):
-    """
-    Core mask-building step used by segmentation_mask_and_contour():
-    builds the LAB chroma-distance foreground mask (see that function's
-    docstring below for why chroma distance, not a fixed HSV threshold)
-    and returns it together with EVERY external contour found in it —
-    unsorted, unfiltered. segmentation_mask_and_contour() picks just the
-    largest one from this.
-    """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
     bg_a, bg_b = estimate_background_chroma(image, border_frac=border_frac)
 
@@ -139,9 +81,13 @@ def _foreground_contours(
     chroma_dist = np.sqrt((a - bg_a) ** 2 + (b - bg_b) ** 2)
     mask = (chroma_dist > chroma_threshold).astype(np.uint8) * 255
 
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    if exclude_leaf_green:
+        mask[_leaf_green_mask(image)] = 0
+
+    close_kernel = np.ones((SEGMENTATION_CLOSE_KSIZE, SEGMENTATION_CLOSE_KSIZE), np.uint8)
+    open_kernel = np.ones((SEGMENTATION_OPEN_KSIZE, SEGMENTATION_OPEN_KSIZE), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return mask, contours
@@ -151,31 +97,174 @@ def segmentation_mask_and_contour(
     image,
     chroma_threshold=SEGMENTATION_CHROMA_THRESHOLD,
     border_frac=SEGMENTATION_BORDER_FRAC,
+    exclude_leaf_green=False,
 ):
-    """
-    Shared core of the segmentation logic: builds the LAB chroma-distance
-    foreground mask and finds its largest contour. This is the function
-    colorDetection.py's inspect_image_yolo() imports and calls directly,
-    to re-segment the crop inside each YOLO detection box.
-
-    Returns (mask, largest_contour). largest_contour is None if nothing
-    was detected.
-
-    Why chroma distance instead of a fixed HSV saturation/value
-    threshold: a soft drop-shadow under the fruit is the SAME background
-    surface, just darker — it keeps the background's hue/chroma (LAB a,
-    b channels), it just has lower lightness (L). A threshold on
-    saturation/value can't tell "background, but darker" apart from "a
-    genuinely different-colored object" nearly as well, so shadows were
-    leaking into the mask. Distance in (a, b) only — deliberately
-    ignoring L — treats a darkened patch of background as still
-    background, while true fruit colors (red/orange/yellow/green,
-    clearly shifted in a/b) still stand out.
-    """
-    mask, contours = _foreground_contours(image, chroma_threshold, border_frac)
+    mask, contours = _foreground_contours(image, chroma_threshold, border_frac, exclude_leaf_green=exclude_leaf_green)
     if not contours:
         return mask, None
 
     largest = max(contours, key=cv2.contourArea)
-    return mask, largest
+
+    solid_mask = np.zeros_like(mask)
+    cv2.drawContours(solid_mask, [largest], -1, 255, thickness=cv2.FILLED)
+
+    return solid_mask, largest
+
+
+DEFAULT_DEFECT_DARKNESS_THRESHOLD = 25.0   # LAB L (0-100) drop below the LOCAL baseline to count a pixel as "defective"
+DEFAULT_DEFECT_AREA_FRACTION = 0.10        # fraction of the fruit's own mask that must be flagged before it counts as a real wound (not just noise/shadow/stem) -- forces label to Rotten.
+DEFAULT_DEFECT_LOW_FRACTION = 0.02         # below this, treat the fruit as having essentially NO visible wound -- used to distrust a CNN "Rotten" call that has no localized evidence behind it
+DEFAULT_DEFECT_BLUR_FRAC = 0.35            # local-baseline median-blur kernel size, as a fraction of the fruit's own bounding-box size
+DEFAULT_DEFECT_EDGE_MARGIN_FRAC = 0.08     # fraction of the fruit's own bounding-box size to exclude right at the silhouette edge when COUNTING defect pixels
+
+
+def detect_defect_fraction(
+    bgr,
+    mask,
+    darkness_threshold=DEFAULT_DEFECT_DARKNESS_THRESHOLD,
+    blur_frac=DEFAULT_DEFECT_BLUR_FRAC,
+    edge_margin_frac=DEFAULT_DEFECT_EDGE_MARGIN_FRAC,
+):
+    fg = mask > 0
+    fg_pixel_count = int(np.sum(fg))
+    if fg_pixel_count == 0:
+        return 0.0
+
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0]
+
+    ys, xs = np.where(fg)
+    bbox_size = max(int(ys.max()) - int(ys.min()), int(xs.max()) - int(xs.min()), 1)
+
+    ksize = int(bbox_size * blur_frac)
+    ksize = max(9, ksize | 1)  # odd, at least 9
+    l_uint8 = np.clip(l_channel, 0, 255).astype(np.uint8)
+    local_baseline = cv2.medianBlur(l_uint8, ksize).astype(np.float32)
+
+    margin_px = max(1, int(bbox_size * edge_margin_frac))
+    erode_kernel = np.ones((margin_px * 2 + 1, margin_px * 2 + 1), np.uint8)
+    eligible = cv2.erode(mask, erode_kernel) > 0
+
+    is_defect = eligible & ((local_baseline - l_channel) > darkness_threshold)
+
+    is_defect_u8 = (is_defect * 255).astype(np.uint8)
+    is_defect_u8 = cv2.morphologyEx(is_defect_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(is_defect_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    largest_defect_area = max(cv2.contourArea(c) for c in contours)
+    return float(largest_defect_area) / float(fg_pixel_count)
+
+
+DEFAULT_MULTI_OBJECT_MIN_AREA_FRAC = 0.008     # objects smaller than this fraction of the image are dropped as noise.
+DEFAULT_MULTI_OBJECT_PEAK_WINDOW_FRAC = 0.05   # local-maxima search window, as a fraction of the image's shorter side -- roughly one fruit's expected radius
+DEFAULT_MULTI_OBJECT_MIN_VALUE = 110           # HSV V channel (0-255), averaged over the candidate blob's own
+DEFAULT_MULTI_OBJECT_MAX_ASPECT = 2.5          # longer/shorter side of the contour's own rotated bounding rect.
+DEFAULT_MULTI_OBJECT_MIN_SOLIDITY = 0.75       # contour_area / convex_hull_area -- real fruit are round/oval and
+
+
+def contour_shape_metrics(contour):
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    area = cv2.contourArea(contour)
+    solidity = (area / hull_area) if hull_area > 0 else 0.0
+    (_cx, _cy), (rw, rh), _angle = cv2.minAreaRect(contour)
+    long_side, short_side = max(rw, rh), max(min(rw, rh), 1e-6)
+    aspect = long_side / short_side
+    perimeter = cv2.arcLength(contour, closed=True)
+    circularity = (4.0 * np.pi * area / (perimeter ** 2)) if perimeter > 0 else 0.0
+    return solidity, aspect, circularity
+
+
+def compute_texture_roughness(bgr, mask, edge_margin_frac=0.08):
+    fg_all = mask > 0
+    if not np.any(fg_all):
+        return 0.0
+
+    ys, xs = np.where(fg_all)
+    bbox_size = max(int(ys.max()) - int(ys.min()), int(xs.max()) - int(xs.min()), 1)
+    margin_px = max(1, int(bbox_size * edge_margin_frac))
+    erode_kernel = np.ones((margin_px * 2 + 1, margin_px * 2 + 1), np.uint8)
+    eligible = cv2.erode(mask, erode_kernel) > 0
+    if not np.any(eligible):
+        eligible = fg_all
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(grad_x, grad_y)
+    return float(grad_mag[eligible].mean())
+
+
+def segment_all_objects(
+    image,
+    chroma_threshold=SEGMENTATION_CHROMA_THRESHOLD,
+    border_frac=SEGMENTATION_BORDER_FRAC,
+    min_area_frac=DEFAULT_MULTI_OBJECT_MIN_AREA_FRAC,
+    peak_window_frac=DEFAULT_MULTI_OBJECT_PEAK_WINDOW_FRAC,
+    min_solidity=DEFAULT_MULTI_OBJECT_MIN_SOLIDITY,
+    max_aspect=DEFAULT_MULTI_OBJECT_MAX_ASPECT,
+    min_value=DEFAULT_MULTI_OBJECT_MIN_VALUE,
+):
+    mask, _contours = _foreground_contours(image, chroma_threshold, border_frac)
+    value_channel = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)[:, :, 2]  # for the brightness-plausibility check below
+
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    if dist.max() <= 0:
+        return []
+
+    win = max(3, int(min(image.shape[:2]) * peak_window_frac) | 1)
+    dilated = cv2.dilate(dist, np.ones((win, win), np.uint8))
+    min_abs_thresh = 3.0
+    local_max = ((dist >= dilated) & (dist > min_abs_thresh)).astype(np.uint8) * 255
+
+    merge_ksize = max(3, int(win * 0.5) | 1)
+    local_max = cv2.dilate(local_max, np.ones((merge_ksize, merge_ksize), np.uint8))
+
+    _num_labels, markers = cv2.connectedComponents(local_max)
+    markers = markers + 1
+
+    sure_bg = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=2)
+    unknown = cv2.subtract(sure_bg, local_max)
+    markers[unknown == 255] = 0
+
+    color_img = image if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    cv2.watershed(color_img, markers)
+
+    image_area = image.shape[0] * image.shape[1]
+    min_area = min_area_frac * image_area
+
+    objects = []
+    for label in range(2, int(markers.max()) + 1):
+        obj_mask = np.zeros(mask.shape, dtype=np.uint8)
+        obj_mask[markers == label] = 255
+        if int(np.sum(obj_mask > 0)) < min_area:
+            continue
+        contours, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+
+        solidity, aspect, _circularity = contour_shape_metrics(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        if solidity < min_solidity or aspect > max_aspect:
+            _dbg(f"segment_all_objects: REJECT bbox={(x,y,w,h)} area={area:.0f} "
+                 f"solidity={solidity:.3f} (min {min_solidity}) aspect={aspect:.3f} (max {max_aspect})")
+            continue
+
+        mean_value = float(value_channel[obj_mask > 0].mean())
+        if mean_value < min_value:
+            _dbg(f"segment_all_objects: REJECT bbox={(x,y,w,h)} area={area:.0f} "
+                 f"mean_value={mean_value:.1f} (min {min_value}) [solidity={solidity:.3f} aspect={aspect:.3f} OK]")
+            continue
+
+        _dbg(f"segment_all_objects: ACCEPT bbox={(x,y,w,h)} area={area:.0f} "
+             f"solidity={solidity:.3f} aspect={aspect:.3f} mean_value={mean_value:.1f}")
+        objects.append({"mask": obj_mask, "contour": contour, "area_px": float(area), "bbox": (x, y, w, h)})
+
+    objects.sort(key=lambda o: o["area_px"], reverse=True)
+    return objects
 
