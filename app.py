@@ -151,9 +151,10 @@ if selected_technique == "Stem Detection":
     # Developer configuration is intentionally hidden from normal users.
     # Automatic mode runs YOLO at a permissive internal threshold, validates
     # the proposals, then falls back to the traditional detector when needed.
-    # Prefer the locally trained V3 weights. If you later copy the chosen
-    # production model to models/best.pt, that path is also supported.
+    # Prefer the locally trained V4 weights (trained on the original set plus
+    # added mango/strawberry examples). Falls back to V3, then models/best.pt.
     _stem_model_candidates = [
+        "runs/detect/fruit_stem_detector_v4/weights/best.pt",
         "runs/detect/fruit_stem_detector_v3/weights/best.pt",
         "models/best.pt",
     ]
