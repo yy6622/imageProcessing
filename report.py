@@ -207,7 +207,15 @@ def generate_report(results, output_path="inspection_report.pdf", batch_name="Fr
             story.append(Spacer(1, 0.3 * cm))
 
         if objects:
-            rows = [["#", "Fruit Type", "Quality", "Type Conf.", "Quality Conf.", "Size"]]
+            # Stem column is only added when at least one object in this
+            # image actually carries a "stem" key (i.e. Stem Detection was
+            # selected for this run) — keeps the report unchanged for
+            # runs/teammates that don't use that module.
+            has_stem_data = any("stem" in obj for obj in objects)
+            header = ["#", "Fruit Type", "Quality", "Type Conf.", "Quality Conf.", "Size"]
+            if has_stem_data:
+                header += ["Stem", "Stem Length"]
+            rows = [header]
             for obj in objects:
                 fruit_type = obj.get("fruit_type") or "Not detected"
                 label = obj.get("label") or "Not classified"
@@ -217,12 +225,24 @@ def generate_report(results, output_path="inspection_report.pdf", batch_name="Fr
                     size = f"{obj['width_cm']:.1f} x {obj['height_cm']:.1f} cm"
                 else:
                     size = f"{obj.get('width_px', 0):.0f} x {obj.get('height_px', 0):.0f} px"
-                rows.append([
+                row = [
                     str(obj.get("index", 0) + 1), fruit_type, label,
                     f"{type_conf * 100:.1f}%", f"{conf * 100:.1f}%", size,
-                ])
+                ]
+                if has_stem_data:
+                    stem = obj.get("stem")
+                    if stem is not None and stem.found:
+                        row.append(stem.condition or "Found")
+                        row.append(f"{stem.length_cm:.1f} cm" if stem.length_cm is not None else f"{stem.length_px:.0f} px")
+                    else:
+                        row.append("Not found")
+                        row.append("-")
+                rows.append(row)
 
-            detail_table = Table(rows, colWidths=[1 * cm, 3 * cm, 3 * cm, 2.7 * cm, 2.7 * cm, 4 * cm])
+            col_widths = [1 * cm, 2.6 * cm, 2.6 * cm, 2.2 * cm, 2.2 * cm, 3 * cm]
+            if has_stem_data:
+                col_widths += [2 * cm, 2.4 * cm]
+            detail_table = Table(rows, colWidths=col_widths)
             detail_table.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#546E7A")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),

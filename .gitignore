@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Raw training images (1.4GB+) — too large for git, not source
+dataset/train/

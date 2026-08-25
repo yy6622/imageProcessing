@@ -1,0 +1,6 @@
+opencv-contrib-python>=4.8
+numpy
+pandas
+streamlit
+reportlab==4.0.9  # newer versions need a Python/OpenSSL hashlib feature this project's Python 3.8 doesn't have
+ultralytics
