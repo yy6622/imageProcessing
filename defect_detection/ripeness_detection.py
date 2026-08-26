@@ -467,6 +467,118 @@ def classify_orange(
 
 
 # ==========================================================
+# Mango Ripeness
+# ==========================================================
+
+def classify_mango(
+    roi,
+    defect_percentage
+):
+    """
+    Classifies Mango as:
+    - Unripe   : green surface is dominant
+    - Ripe     : yellow / orange / red mature colour is present
+    - Overripe : substantial visible defect / rot
+    """
+
+    hsv = cv.cvtColor(
+        roi,
+        cv.COLOR_BGR2HSV
+    )
+
+    fruit_mask = get_fruit_mask(
+        roi
+    )
+
+    if cv.countNonZero(fruit_mask) == 0:
+        return (
+            "Unknown",
+            0.0,
+            0.0
+        )
+
+    # ------------------------------------------------------
+    # Green = Unripe
+    # ------------------------------------------------------
+
+    green = colour_percentage(
+        hsv,
+        [30, 30, 30],
+        [95, 255, 255],
+        fruit_mask
+    )
+
+    # ------------------------------------------------------
+    # Yellow / Orange = Mature / Ripe
+    # ------------------------------------------------------
+
+    yellow_orange = colour_percentage(
+        hsv,
+        [10, 35, 50],
+        [29, 255, 255],
+        fruit_mask
+    )
+
+    # ------------------------------------------------------
+    # Red blush = Mature / Ripe
+    # ------------------------------------------------------
+
+    red1 = colour_percentage(
+        hsv,
+        [0, 45, 40],
+        [10, 255, 255],
+        fruit_mask
+    )
+
+    red2 = colour_percentage(
+        hsv,
+        [170, 45, 40],
+        [180, 255, 255],
+        fruit_mask
+    )
+
+    red = red1 + red2
+
+    mature_colour = yellow_orange + red
+
+    # ======================================================
+    # Mango Ripeness Decision
+    # ======================================================
+
+    # Strong visible deterioration has priority.
+    if defect_percentage >= 15.0:
+        ripeness = "Overripe"
+
+    # Clearly green-dominant mango.
+    elif (
+        green >= 40.0
+        and green > mature_colour
+    ):
+        ripeness = "Unripe"
+
+    # Yellow/orange/red mature mango.
+    elif mature_colour >= 25.0:
+        ripeness = "Ripe"
+
+    # Moderate defect on a mango that is no longer strongly green.
+    elif (
+        defect_percentage >= 8.0
+        and green < 35.0
+    ):
+        ripeness = "Overripe"
+
+    # Conservative fallback.
+    else:
+        ripeness = "Unripe"
+
+    return (
+        ripeness,
+        green,
+        mature_colour
+    )
+
+
+# ==========================================================
 # Strawberry Ripeness
 # ==========================================================
 
@@ -573,7 +685,7 @@ def classify_strawberry(
     #   has already dropped below 70%, which is more consistent with
     #   deterioration / browning.
     if (
-        defect_percentage >= 15.0
+        defect_percentage >= 12.0
         or (
             defect_percentage >= 8.0
             and red < 70.0
@@ -681,6 +793,22 @@ def classify_ripeness(
             colour1,
             colour2
         ) = classify_orange(
+            roi,
+            defect_percentage
+        )
+
+
+    # ------------------------------------------------------
+    # Mango
+    # ------------------------------------------------------
+
+    elif fruit_type == "mango":
+
+        (
+            ripeness,
+            colour1,
+            colour2
+        ) = classify_mango(
             roi,
             defect_percentage
         )

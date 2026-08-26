@@ -1002,16 +1002,59 @@ def detect_banana_defect(roi):
     # ======================================================
     # 14. Draw Defects
     # ======================================================
+    #
+    # DISPLAY-ONLY cleanup:
+    # Keep the defect percentage above unchanged, but do not draw
+    # red contours directly on the outer banana edge / crop-contact
+    # shadow. This makes the red outline point to damaged peel rather
+    # than the banana silhouette itself.
 
     output = roi.copy()
 
-    contours, _ = cv.findContours(
+    display_distance = cv.distanceTransform(
+        fruit_mask,
+        cv.DIST_L2,
+        5
+    )
+
+    h, w = fruit_mask.shape
+
+    # Stronger display-only boundary protection.
+    # This removes red contours that still follow the banana outline,
+    # tip, stem edge, and overlap/contact boundary.
+    display_margin = max(
+        10,
+        int(min(h, w) * 0.055)
+    )
+
+    display_inner_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    display_inner_mask[
+        display_distance >= display_margin
+    ] = 255
+
+    display_defect_mask = cv.bitwise_and(
         defect_mask,
+        display_inner_mask
+    )
+
+    # Light cleanup only for display. Do not change defect_percentage.
+    display_defect_mask = cv.morphologyEx(
+        display_defect_mask,
+        cv.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    display_contours, _ = cv.findContours(
+        display_defect_mask,
         cv.RETR_EXTERNAL,
         cv.CHAIN_APPROX_SIMPLE
     )
 
-    for contour in contours:
+    for contour in display_contours:
 
         if cv.contourArea(contour) > 60:
 
@@ -1274,7 +1317,75 @@ def detect_apple_defect(roi):
 
 
     # ======================================================
-    # 4. Combine Colour + Wrinkle Defects
+    # 4. Apple-specific boundary handling
+    # ======================================================
+    #
+    # Use different safe margins for colour defects and wrinkles.
+    #
+    # Colour defects:
+    #   use a stronger inner margin because leaf contact / fruit-edge
+    #   shadows are often dark/brown and can become false defects.
+    #
+    # Wrinkles:
+    #   use a smaller margin so genuine shrivel texture near the apple
+    #   edge (especially on an overripe apple) is still detected.
+
+    distance = cv.distanceTransform(
+        fruit_mask,
+        cv.DIST_L2,
+        5
+    )
+
+    h, w = fruit_mask.shape
+
+    colour_margin = max(
+        12,
+        int(min(h, w) * 0.12)
+    )
+
+    # Normal apples keep a safer edge margin.
+    # If the apple is globally very wrinkled/shrivelled, reduce the
+    # wrinkle-only margin so genuine wrinkles near the right/outer side
+    # are not removed.
+    if wrinkle_percentage >= 12.0:
+        wrinkle_margin = max(
+            4,
+            int(min(h, w) * 0.03)
+        )
+    else:
+        wrinkle_margin = max(
+            6,
+            int(min(h, w) * 0.05)
+        )
+
+    colour_safe_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    wrinkle_safe_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    colour_safe_mask[
+        distance >= colour_margin
+    ] = 255
+
+    wrinkle_safe_mask[
+        distance >= wrinkle_margin
+    ] = 255
+
+    colour_mask = cv.bitwise_and(
+        colour_mask,
+        colour_safe_mask
+    )
+
+    wrinkle_mask = cv.bitwise_and(
+        wrinkle_mask,
+        wrinkle_safe_mask
+    )
+
+    # ======================================================
+    # 5. Combine Colour + Wrinkle Defects
     # ======================================================
 
     defect_mask = cv.bitwise_or(
@@ -1282,8 +1393,6 @@ def detect_apple_defect(roi):
         wrinkle_mask
     )
 
-
-    # Keep defects inside apple
     defect_mask = cv.bitwise_and(
         defect_mask,
         fruit_mask
@@ -1311,6 +1420,131 @@ def detect_apple_defect(roi):
         defect_mask,
         fruit_mask
     )
+
+    # ======================================================
+    # 5c. REMOVE SMALL / THIN APPLE FALSE DEFECTS
+    # ======================================================
+    #
+    # Healthy green apples often contain:
+    # - stem / blossom marks
+    # - watermark / texture edges
+    # - small leaf-contact shadows
+    #
+    # These should not create red defect contours. Keep only
+    # meaningful interior defect regions.
+
+    fruit_pixels_for_clean = cv.countNonZero(
+        fruit_mask
+    )
+
+    # Healthy apples need strict cleanup because leaf contact,
+    # highlights and fruit edges can create false red contours.
+    #
+    # A strongly shrivelled apple is different: genuine wrinkle
+    # structures are numerous and often long/thin. In that case,
+    # keeping the same strict 0.5% area + 0.22 extent rule removes
+    # real wrinkles, especially on the right side.
+    strong_shrivel = (
+        wrinkle_percentage >= 12.0
+    )
+
+    normal_min_component_area = max(
+        100,
+        int(fruit_pixels_for_clean * 0.005)
+    )
+
+    wrinkle_min_component_area = max(
+        45,
+        int(fruit_pixels_for_clean * 0.0005)
+    )
+
+    cleaned_apple_mask = np.zeros_like(
+        defect_mask
+    )
+
+    apple_contours, _ = cv.findContours(
+        defect_mask,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    for contour in apple_contours:
+
+        area = cv.contourArea(
+            contour
+        )
+
+        x, y, cw, ch = cv.boundingRect(
+            contour
+        )
+
+        bbox_area = max(
+            1,
+            cw * ch
+        )
+
+        extent = (
+            area / bbox_area
+        )
+
+        # Check whether this combined component is genuinely supported
+        # by the wrinkle detector.
+        component_mask = np.zeros_like(
+            defect_mask
+        )
+
+        cv.drawContours(
+            component_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        wrinkle_overlap_pixels = cv.countNonZero(
+            cv.bitwise_and(
+                component_mask,
+                wrinkle_mask
+            )
+        )
+
+        component_pixels = max(
+            1,
+            cv.countNonZero(
+                component_mask
+            )
+        )
+
+        wrinkle_overlap_ratio = (
+            wrinkle_overlap_pixels
+            / component_pixels
+        )
+
+        if strong_shrivel and wrinkle_overlap_ratio >= 0.35:
+
+            # On a clearly shrivelled apple, preserve meaningful
+            # wrinkle-supported components even if they are thin.
+            if area < wrinkle_min_component_area:
+                continue
+
+        else:
+
+            # Normal / healthy apple behaviour remains strict.
+            if area < normal_min_component_area:
+                continue
+
+            if extent < 0.22:
+                continue
+
+        cv.drawContours(
+            cleaned_apple_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+    defect_mask = cleaned_apple_mask
 
     # ======================================================
     # 6. Calculate Defect Percentage

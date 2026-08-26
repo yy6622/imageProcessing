@@ -6,7 +6,7 @@ from ultralytics import YOLO
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
 
-IMAGE_PATH = CURRENT_DIR / "orange_major.png"
+IMAGE_PATH = CURRENT_DIR / "image.png"
 
 model = YOLO(
     PROJECT_ROOT

@@ -28,7 +28,7 @@ from segmentation import (
 )
 
 
-IMAGE_PATH = CURRENT_DIR / "image.png"
+IMAGE_PATH = CURRENT_DIR / "rotten_banana.png"
 
 MODEL_PATH = (
     PROJECT_ROOT
@@ -49,7 +49,7 @@ YOLO_CONF = 0.25
 YOLO_IOU = 0.45
 
 # Class-specific confidence filtering
-APPLE_MIN_CONF = 0.85
+APPLE_MIN_CONF = 0.65
 BANANA_MIN_CONF = 0.55
 
 # Do NOT add another Orange filter.
@@ -1014,6 +1014,72 @@ def refine_strawberry_defect_result(
                 cv.FILLED
             )
 
+    # ------------------------------------------------------
+    # HEALTHY RIPE STRAWBERRY OVERLAP / SHADOW SAFETY
+    # ------------------------------------------------------
+    #
+    # When two strawberries overlap, the neighbouring rotten fruit
+    # can enter the YOLO crop of a healthy red strawberry. That dark
+    # patch often touches the rectangular ROI edge and was previously
+    # counted as a defect on the healthy fruit.
+    #
+    # Apply this only when the strawberry itself is strongly red.
+    # Damaged strawberries with reduced red coverage keep the normal
+    # detector so genuine large rot is not removed.
+
+    strawberry_red_ratio = calculate_red_ratio(
+        roi,
+        strawberry_mask
+    )
+
+    if strawberry_red_ratio >= 0.70:
+
+        border_margin = max(
+            5,
+            int(min(final_mask.shape) * 0.025)
+        )
+
+        border_clean = np.zeros_like(
+            final_mask
+        )
+
+        border_contours, _ = cv.findContours(
+            final_mask,
+            cv.RETR_EXTERNAL,
+            cv.CHAIN_APPROX_SIMPLE
+        )
+
+        fh, fw = final_mask.shape
+
+        for contour in border_contours:
+
+            x, y, cw, ch = cv.boundingRect(
+                contour
+            )
+
+            touches_roi_edge = (
+                x <= border_margin
+                or y <= border_margin
+                or (x + cw) >= (fw - border_margin)
+                or (y + ch) >= (fh - border_margin)
+            )
+
+            # On a strongly red/healthy-looking strawberry, a large
+            # dark component entering from the ROI edge is much more
+            # likely to belong to an overlapping neighbour/shadow.
+            if touches_roi_edge:
+                continue
+
+            cv.drawContours(
+                border_clean,
+                [contour],
+                -1,
+                255,
+                cv.FILLED
+            )
+
+        final_mask = border_clean
+
     defect_pixels = cv.countNonZero(
         final_mask
     )
@@ -1853,6 +1919,15 @@ for result in results:
             fruit_mask
         )
 
+        print(
+            f"Shape aspect ALL: {aspect:.3f}"
+        )
+
+        print(
+            f"Shape circularity ALL: "
+            f"{circularity if circularity is not None else 'N/A'}"
+        )
+
         # Always ask the friend's type CNN to verify the ROI.
         #
         # Reason:
@@ -1874,6 +1949,30 @@ for result in results:
             cnn_type = None
             cnn_conf = 0.0
 
+        # -------------------------------------------------
+        # SECOND TYPE CHECK ON ORIGINAL ROI
+        # -------------------------------------------------
+        # The friend's CNN may have been trained on normal photos.
+        # A black-background segmented crop can sometimes make a
+        # Mango look like Orange. Re-check the untouched YOLO crop.
+        raw_cnn_type = None
+        raw_cnn_conf = 0.0
+
+        try:
+            raw_cnn_type, raw_cnn_conf, _ = (
+                classify_fruit_type_cnn(
+                    raw_roi
+                )
+            )
+        except Exception:
+            raw_cnn_type = None
+            raw_cnn_conf = 0.0
+
+        print(
+            f"CNN raw-ROI type: {raw_cnn_type} | "
+            f"Conf: {raw_cnn_conf * 100:.2f}%"
+        )
+
         cnn_override = choose_cnn_override(
             yolo_confidence,
             cnn_type,
@@ -1892,6 +1991,266 @@ for result in results:
         if cnn_override is not None:
             fruit_type = cnn_override
             confidence = cnn_conf
+
+        # -------------------------------------------------
+        # GREEN STRAWBERRY / WEAK ORANGE SPECIAL CASE
+        # -------------------------------------------------
+        # Real unripe Strawberry sample:
+        #   YOLO Orange       = 56.20%
+        #   processed CNN     = Strawberry 98.02%
+        #   raw-ROI CNN       = Strawberry 99.97%
+        #   red ratio         = 0.00%
+        #   aspect            = 1.218
+        #   circularity       = 0.743
+        if (
+            fruit_type == "orange"
+            and raw_yolo_type == "orange"
+            and yolo_confidence < 0.70
+            and cnn_type == "Strawberry"
+            and cnn_conf >= 0.975
+            and raw_cnn_type == "Strawberry"
+            and raw_cnn_conf >= 0.995
+            and red_ratio <= 0.10
+            and aspect >= 1.15
+            and circularity is not None
+            and circularity < 0.76
+        ):
+            fruit_type = "strawberry"
+            confidence = max(
+                cnn_conf,
+                raw_cnn_conf
+            )
+
+            print(
+                "Weak Orange corrected to green Strawberry "
+                f"(YOLO={yolo_confidence * 100:.2f}%, "
+                f"CNN={cnn_conf * 100:.2f}%, "
+                f"rawCNN={raw_cnn_conf * 100:.2f}%, "
+                f"aspect={aspect:.3f}, "
+                f"circularity={circularity:.3f})."
+            )
+
+        # -------------------------------------------------
+        # DAMAGED STRAWBERRY / APPLE OVERRIDE
+        # -------------------------------------------------
+        # Real rotten Strawberry sample:
+        #   YOLO Apple        = 91.70%
+        #   processed CNN     = Strawberry 94.77%
+        #   raw-ROI CNN       = Strawberry 99.58%
+        #   red ratio         = 39.14%
+        #   aspect            = 1.273
+        #   circularity       = 0.684
+        #
+        # The normal damaged-Strawberry rule requires processed CNN
+        # confidence >= 97%, so this real Strawberry was left as Apple.
+        # Use the raw-ROI CNN as extra evidence, but keep strong
+        # shape/red safety checks so normal apples are not changed.
+        if (
+            fruit_type == "apple"
+            and raw_yolo_type == "apple"
+            and cnn_type == "Strawberry"
+            and cnn_conf >= 0.90
+            and raw_cnn_type == "Strawberry"
+            and raw_cnn_conf >= 0.99
+            and 0.15 <= red_ratio < 0.70
+            and aspect >= 1.15
+            and circularity is not None
+            and circularity < 0.72
+        ):
+            fruit_type = "strawberry"
+            confidence = max(
+                cnn_conf,
+                raw_cnn_conf
+            )
+
+            print(
+                "Apple corrected to damaged Strawberry "
+                f"(YOLO={yolo_confidence * 100:.2f}%, "
+                f"CNN={cnn_conf * 100:.2f}%, "
+                f"rawCNN={raw_cnn_conf * 100:.2f}%, "
+                f"red={red_ratio * 100:.2f}%, "
+                f"aspect={aspect:.3f}, "
+                f"circularity={circularity:.3f})."
+            )
+
+        # -------------------------------------------------
+        # RAW-ROI CNN MANGO RECHECK
+        # -------------------------------------------------
+        # Trust a strong Mango result from the original, unmasked crop.
+        # This helps Mango images that the segmented/calibrated CNN crop
+        # incorrectly calls Orange.
+        if (
+            fruit_type not in {"mango", "strawberry"}
+            # Mango is an unseen class for YOLO, but raw-ROI CNN alone
+            # is not enough: background / banana fragments can also be
+            # called Mango with very high confidence.
+            #
+            # Require BOTH CNN views to support Mango, plus a
+            # Mango-like oval shape.
+            and raw_yolo_type in {"orange", "banana"}
+            and raw_cnn_type == "Mango"
+            and raw_cnn_conf >= 0.95
+            and cnn_type == "Mango"
+            and cnn_conf >= 0.80
+            and aspect >= 1.15
+            and circularity is not None
+            and circularity < 0.90
+        ):
+            fruit_type = "mango"
+            confidence = max(
+                raw_cnn_conf,
+                cnn_conf
+            )
+
+            print(
+                "Raw-ROI CNN corrected fruit to Mango "
+                f"(rawCNN={raw_cnn_conf * 100:.2f}%, "
+                f"CNN={cnn_conf * 100:.2f}%, "
+                f"aspect={aspect:.3f}, "
+                f"circularity={circularity:.3f})."
+            )
+
+        # -------------------------------------------------
+        # BANANA -> MANGO DISAGREEMENT FALLBACK
+        # -------------------------------------------------
+        # Rotten Mango sample:
+        # YOLO Banana 80.16%, processed CNN Orange 76.82%,
+        # aspect 1.125, circularity 0.782, red 19.40%.
+        #
+        # A true banana is normally much more elongated/curved.
+        # Only apply when the two models DISAGREE and the object is
+        # compact/oval rather than banana-shaped.
+        if (
+            fruit_type == "banana"
+            and raw_yolo_type == "banana"
+            and yolo_confidence <= 0.85
+            and cnn_type == "Orange"
+            and cnn_conf <= 0.85
+            and 0.10 <= red_ratio <= 0.35
+            and aspect <= 1.25
+            and circularity is not None
+            and 0.70 <= circularity < 0.85
+        ):
+            fruit_type = "mango"
+            confidence = max(
+                yolo_confidence,
+                cnn_conf
+            )
+
+            print(
+                "Banana -> Mango disagreement fallback applied "
+                f"(aspect={aspect:.3f}, "
+                f"circularity={circularity:.3f}, "
+                f"red={red_ratio * 100:.2f}%)."
+            )
+
+        # -------------------------------------------------
+        # LOW-RED WEAK-ORANGE -> MANGO FALLBACK
+        # -------------------------------------------------
+        # This handles a Mango that BOTH YOLO and the friend's CNN
+        # call Orange, but neither model is very confident.
+        #
+        # Current real Mango sample:
+        #   YOLO Orange      = 87.58%
+        #   CNN processed    = 81.79%
+        #   CNN raw ROI      = 79.68%
+        #   red ratio        = 1.80%
+        #   aspect           = 1.045
+        #   circularity      = 0.759
+        #
+        # Safety:
+        # - keep this only for weak Orange agreement
+        # - require almost no red/orange-red surface
+        # - require a noticeably non-round contour
+        if (
+            fruit_type == "orange"
+            and raw_yolo_type == "orange"
+            and cnn_type == "Orange"
+            and yolo_confidence < 0.90
+            and cnn_conf < 0.85
+            and (
+                raw_cnn_type is None
+                or raw_cnn_type == "Orange"
+            )
+            and raw_cnn_conf < 0.85
+            and red_ratio <= 0.08
+            and circularity is not None
+            and circularity < 0.77
+        ):
+            fruit_type = "mango"
+            confidence = max(
+                yolo_confidence,
+                cnn_conf,
+                raw_cnn_conf
+            )
+
+            print(
+                "Weak low-red Orange -> Mango fallback applied "
+                f"(YOLO={yolo_confidence * 100:.2f}%, "
+                f"CNN={cnn_conf * 100:.2f}%, "
+                f"rawCNN={raw_cnn_conf * 100:.2f}%, "
+                f"red={red_ratio * 100:.2f}%, "
+                f"circularity={circularity:.3f})."
+            )
+
+        # -------------------------------------------------
+        # MANGO SHAPE FALLBACK
+        # -------------------------------------------------
+        # Special case:
+        # YOLO only knows Apple/Banana/Orange, and the friend's
+        # CNN can occasionally also call a Mango "Orange".
+        #
+        # Use a conservative shape fallback only when BOTH models
+        # say Orange but the segmented fruit is clearly elongated
+        # and less circular than a normal round orange.
+        #
+        # Current real Mango sample:
+        #   aspect      = 1.238
+        #   circularity = 0.777
+        #   CNN Orange confidence = 90.86%
+        if (
+            cnn_override is None
+            and raw_yolo_type == "orange"
+            and cnn_type == "Orange"
+            # Strong raw-ROI Orange evidence is a veto.
+            # Current real mouldy Orange:
+            #   YOLO Orange = 98.25%
+            #   raw-ROI CNN Orange = 100.00%
+            # Even if segmentation makes the shape elongated,
+            # do NOT convert it to Mango.
+            and not (
+                raw_cnn_type == "Orange"
+                and raw_cnn_conf >= 0.95
+            )
+            and circularity is not None
+            and (
+                # Green / yellow Mango case:
+                # little strawberry-red, moderately elongated.
+                (
+                    cnn_conf <= 0.93
+                    and red_ratio <= 0.15
+                    and aspect >= 1.23
+                    and circularity < 0.79
+                )
+                or
+                # Ripe / damaged Mango case:
+                # red/orange colour can be high, so rely on a
+                # distinctly elongated + less-circular fruit shape.
+                (
+                    aspect >= 1.24
+                    and circularity < 0.76
+                )
+            )
+        ):
+            fruit_type = "mango"
+            confidence = cnn_conf
+
+            print(
+                "Orange -> Mango shape fallback applied "
+                f"(aspect={aspect:.3f}, "
+                f"circularity={circularity:.3f}, "
+                f"red={red_ratio * 100:.2f}%)"
+            )
 
         # -------------------------------------------------
         # LARGE YOLO ORANGE -> STRAWBERRY CORRECTION
@@ -2505,15 +2864,26 @@ for blob in blobs:
             <= blob_diag * 0.28
         )
 
-        # Skip only when this blob is strongly overlapping AND
-        # centred on the same already-processed fruit.
+        # Skip segmented fragments that are already part of a
+        # confirmed YOLO fruit.
         #
-        # This prevents one large YOLO box from blocking another
-        # nearby Strawberry.
+        # The old rule required >=65% overlap AND almost the same
+        # centre. In an apple cluster, segmentation can return only
+        # one small piece of an already-detected apple, so its centre
+        # shifts and the piece was incorrectly sent to the Mango /
+        # Strawberry fallback CNN.
+        #
+        # Keep Strawberry handling conservative, but for confirmed
+        # Apple/Banana/Orange also suppress a smaller contained piece
+        # when most of that blob lies inside the YOLO fruit box.
         if (
             (
                 confirmed_type == "strawberry"
                 and overlap_ratio >= 0.75
+            )
+            or (
+                confirmed_type in {"apple", "banana", "orange"}
+                and overlap_ratio >= 0.45
             )
             or (
                 overlap_ratio >= 0.65
