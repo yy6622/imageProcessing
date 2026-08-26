@@ -5057,11 +5057,6 @@ def detect_mango_defect(roi):
 
     defect_mask = cv.bitwise_or(
         defect_mask,
-        severe_brown_mask
-    )
-
-    defect_mask = cv.bitwise_or(
-        defect_mask,
         black_mask
     )
 
