@@ -15,6 +15,20 @@ import calibration as calib
 from colorDetection import inspect_image_yolo
 import report as report_mod
 
+# ======================================================
+# PEI WEN — V12 MORPHOLOGICAL + TEXTURE HYBRID
+# ======================================================
+# Uses the latest standalone agreement-aware system.
+try:
+    import fruit_v12_hybrid_final_agreement_guard as morph_texture_v12
+    MORPH_TEXTURE_AVAILABLE = True
+    MORPH_TEXTURE_IMPORT_ERROR = None
+except Exception as exc:
+    morph_texture_v12 = None
+    MORPH_TEXTURE_AVAILABLE = False
+    MORPH_TEXTURE_IMPORT_ERROR = str(exc)
+
+
 
 # ======================================================
 # TIFANY — EXACT LATEST DEFECT DETECTION
@@ -3214,6 +3228,385 @@ def summary_to_text(summary):
     return "; ".join(parts) if parts else "No fruit detected"
 
 
+
+# ======================================================
+# PEI WEN — STREAMLIT ADAPTER FOR LATEST V12 HYBRID
+# ======================================================
+
+@st.cache_resource
+def _load_morph_texture_v12_models():
+    if not MORPH_TEXTURE_AVAILABLE:
+        raise RuntimeError(
+            "Morphological + Texture module cannot be imported: "
+            f"{MORPH_TEXTURE_IMPORT_ERROR}"
+        )
+
+    yolo_model = morph_texture_v12.YOLO(
+        str(morph_texture_v12.YOLO_MODEL_PATH)
+    )
+    feature_model = morph_texture_v12.joblib.load(
+        morph_texture_v12.FEATURE_MODEL_PATH
+    )
+    feature_names = list(
+        morph_texture_v12.joblib.load(
+            morph_texture_v12.FEATURE_NAMES_PATH
+        )
+    )
+    size_thresholds = morph_texture_v12.load_size_thresholds()
+
+    return (
+        yolo_model,
+        feature_model,
+        feature_names,
+        size_thresholds,
+    )
+
+
+def inspect_image_morph_texture_v12(image):
+    """
+    Streamlit-compatible version of the latest standalone
+    V12 YOLO + Geometrical + Texture + Agreement-Aware Unknown Guard.
+
+    IMPORTANT:
+    - classification logic is NOT replaced by colorDetection.py
+    - uses V12 YOLO localisation
+    - uses the latest Geometry + Texture Random Forest
+    - uses agreement-aware fusion
+    - keeps Unknown/Other rejection
+    - uses the latest size classification logic
+    """
+
+    (
+        yolo_model,
+        feature_model,
+        feature_names,
+        size_thresholds,
+    ) = _load_morph_texture_v12_models()
+
+    image_h, image_w = image.shape[:2]
+
+    result = yolo_model.predict(
+        source=image,
+        conf=morph_texture_v12.YOLO_CONF,
+        iou=morph_texture_v12.YOLO_IOU,
+        imgsz=morph_texture_v12.YOLO_IMGSZ,
+        max_det=morph_texture_v12.MAX_DET,
+        verbose=False,
+    )[0]
+
+    detections = []
+
+    for box in result.boxes:
+        class_id = int(box.cls[0].item())
+        confidence = float(box.conf[0].item())
+
+        x1, y1, x2, y2 = map(
+            int,
+            box.xyxy[0].tolist(),
+        )
+
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(image_w, x2)
+        y2 = min(image_h, y2)
+
+        current_box = (x1, y1, x2, y2)
+
+        if not morph_texture_v12.valid_box(
+            current_box,
+            image_w,
+            image_h,
+        ):
+            continue
+
+        detections.append({
+            "box": current_box,
+            "yolo_class": str(
+                yolo_model.names[class_id]
+            ).strip().lower(),
+            "yolo_confidence": confidence,
+        })
+
+    detections = morph_texture_v12.remove_duplicate_detections(
+        detections
+    )
+
+    hybrid_objects = []
+
+    for detection in detections:
+        x1, y1, x2, y2 = detection["box"]
+        crop = image[y1:y2, x1:x2].copy()
+
+        if crop.size == 0:
+            continue
+
+        features, mask, contour = (
+            morph_texture_v12.extract_all_features(
+                crop,
+                feature_names,
+            )
+        )
+
+        if features is None or contour is None:
+            continue
+
+        (
+            feature_class,
+            feature_confidence,
+            feature_probabilities,
+        ) = morph_texture_v12.predict_feature_class(
+            feature_model,
+            feature_names,
+            features,
+        )
+
+        (
+            final_class,
+            final_confidence,
+            decision_method,
+            rejected,
+        ) = morph_texture_v12.fuse_predictions(
+            detection["yolo_class"],
+            detection["yolo_confidence"],
+            feature_class,
+            feature_confidence,
+            feature_probabilities,
+        )
+
+        if rejected:
+            continue
+
+        geometry = morph_texture_v12.extract_size_geometry(
+            contour,
+            image.shape,
+        )
+
+        if final_class == morph_texture_v12.UNKNOWN_CLASS_NAME:
+            threshold_size = "Unknown"
+            size_feature = None
+            size_value = None
+        else:
+            (
+                threshold_size,
+                size_feature,
+                size_value,
+            ) = morph_texture_v12.classify_dataset_size(
+                final_class,
+                geometry,
+                size_thresholds,
+            )
+
+        contour_global = contour.copy()
+        contour_global[:, 0, 0] += x1
+        contour_global[:, 0, 1] += y1
+
+        hybrid_objects.append({
+            "box": detection["box"],
+            "crop": crop,
+            "mask": mask,
+
+            "yolo_class": detection["yolo_class"],
+            "yolo_confidence": detection["yolo_confidence"],
+
+            "feature_class": feature_class,
+            "feature_confidence": feature_confidence,
+            "feature_probabilities": feature_probabilities,
+
+            "final_class": final_class,
+            "final_confidence": final_confidence,
+            "decision_method": decision_method,
+
+            "features": features,
+            "geometry": geometry,
+
+            "threshold_size": threshold_size,
+            "size": threshold_size,
+            "size_feature": size_feature,
+            "size_value": size_value,
+            "size_method": "dataset_threshold",
+            "relative_ratio": None,
+
+            "contour_global": contour_global,
+        })
+
+    morph_texture_v12.apply_group_relative_size(
+        hybrid_objects
+    )
+
+    # Draw using the exact standalone drawing logic.
+    annotated = morph_texture_v12.draw_result(
+        image,
+        hybrid_objects,
+    )
+
+    # Convert latest hybrid result to the data structure already
+    # expected by the existing Streamlit dashboard.
+    objects = []
+    summary = {}
+
+    for index, obj in enumerate(hybrid_objects):
+        x1, y1, x2, y2 = obj["box"]
+        final_class = obj["final_class"]
+        is_unknown = (
+            final_class
+            == morph_texture_v12.UNKNOWN_CLASS_NAME
+        )
+
+        crop = image[y1:y2, x1:x2].copy()
+
+        # Isolated crop for the existing UI.
+        crop_isolated = crop.copy()
+        local_mask = obj.get("mask")
+
+        if (
+            local_mask is not None
+            and local_mask.shape[:2] == crop.shape[:2]
+        ):
+            white_bg = np.full_like(crop, 255)
+            crop_isolated = np.where(
+                local_mask[:, :, None] > 0,
+                crop,
+                white_bg,
+            )
+
+        geometry = obj["geometry"]
+        features = obj["features"]
+
+        streamlit_obj = {
+            "index": index,
+            "bbox": obj["box"],
+            "box": obj["box"],
+
+            "fruit_type": (
+                None
+                if is_unknown
+                else final_class.title()
+            ),
+            "fruit_type_confidence": float(
+                obj["final_confidence"]
+            ),
+
+            "raw_yolo_type": obj["yolo_class"].title(),
+            "yolo_confidence": float(
+                obj["yolo_confidence"]
+            ),
+
+            "feature_type": obj["feature_class"].title(),
+            "feature_confidence": float(
+                obj["feature_confidence"]
+            ),
+
+            "classification_method": obj["decision_method"],
+
+            "size_class": (
+                "Unknown"
+                if is_unknown
+                else obj["size"]
+            ),
+            "size_feature": obj.get("size_feature"),
+            "size_value": obj.get("size_value"),
+            "size_method": obj.get("size_method"),
+            "relative_ratio": obj.get("relative_ratio"),
+
+            "geo_aspect_ratio": features.get(
+                "geo_aspect_ratio", 0.0
+            ),
+            "geo_circularity": features.get(
+                "geo_circularity", 0.0
+            ),
+            "geo_extent": features.get(
+                "geo_extent", 0.0
+            ),
+            "geo_area_ratio": features.get(
+                "geo_area_ratio", 0.0
+            ),
+            "geo_perimeter_ratio": features.get(
+                "geo_perimeter_ratio", 0.0
+            ),
+            "geo_equivalent_diameter_ratio": features.get(
+                "geo_equivalent_diameter_ratio", 0.0
+            ),
+            "geo_major_axis_ratio": features.get(
+                "geo_major_axis_ratio", 0.0
+            ),
+            "geo_minor_axis_ratio": features.get(
+                "geo_minor_axis_ratio", 0.0
+            ),
+            "geo_solidity": features.get(
+                "geo_solidity", 0.0
+            ),
+
+            "tex_contrast": features.get(
+                "tex_contrast", 0.0
+            ),
+            "tex_energy": features.get(
+                "tex_energy", 0.0
+            ),
+            "tex_homogeneity": features.get(
+                "tex_homogeneity", 0.0
+            ),
+            "tex_correlation": features.get(
+                "tex_correlation", 0.0
+            ),
+            "tex_entropy": features.get(
+                "tex_entropy", 0.0
+            ),
+            "tex_mean_intensity": features.get(
+                "tex_mean_intensity", 0.0
+            ),
+            "tex_std_intensity": features.get(
+                "tex_std_intensity", 0.0
+            ),
+
+            "width_px": float(x2 - x1),
+            "height_px": float(y2 - y1),
+            "area_px": float(
+                geometry.get(
+                    "area_px",
+                    (x2 - x1) * (y2 - y1),
+                )
+            ),
+
+            # Physical dimensions are not inferred by this model.
+            "width_cm": None,
+            "height_cm": None,
+            "area_cm2": None,
+
+            # Existing dashboard compatibility fields.
+            "label": None,
+            "confidence": 0.0,
+            "defect_fraction": 0.0,
+            "classification": None,
+
+            "crop": crop,
+            "crop_isolated": crop_isolated,
+        }
+
+        objects.append(streamlit_obj)
+
+        summary_key = (
+            "Unknown/Other"
+            if is_unknown
+            else final_class.title()
+        )
+        summary.setdefault(summary_key, {})
+        size_key = streamlit_obj["size_class"]
+        summary[summary_key][size_key] = (
+            summary[summary_key].get(size_key, 0) + 1
+        )
+
+    return {
+        "original": image,
+        "annotated": annotated,
+        "objects": objects,
+        "count": len(objects),
+        "summary": summary,
+        "calibration_method": "Dataset-relative size threshold",
+        "calibration_confidence": "V12 hybrid",
+    }
+
+
+
 # ======================================================
 # Sidebar — minimal configuration
 # ======================================================
@@ -3237,10 +3630,23 @@ selected_technique = st.sidebar.selectbox(
          "and Morphological and Texture Feature Extraction are connected to their "
          "respective pipelines. Other teammate modules keep their existing behaviour.",
 )
-if selected_technique not in (IMPLEMENTED_TECHNIQUE, "Stem Detection"):
+if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+    if MORPH_TEXTURE_AVAILABLE:
+        st.sidebar.success(
+            "V12 YOLO + Geometrical + Texture + Agreement-Aware Unknown Guard loaded."
+        )
+    else:
+        st.sidebar.error(
+            "Morphological + Texture module failed to load: "
+            f"{MORPH_TEXTURE_IMPORT_ERROR}"
+        )
+elif selected_technique not in (
+    IMPLEMENTED_TECHNIQUE,
+    "Stem Detection",
+    "Defect Detection",
+):
     st.sidebar.caption(
-        f"ℹ️ “{selected_technique}” isn't implemented in this module yet — "
-        f"running the same {IMPLEMENTED_TECHNIQUE} pipeline (LAB + YOLO + CNN) below."
+        f"ℹ️ “{selected_technique}” uses the existing combined workflow."
     )
 
 # ======================================================
@@ -3665,9 +4071,19 @@ if uploaded_files:
         if img is not None:
             images_to_process.append((f.name, img))
 
+morph_texture_blocked = (
+    selected_technique == MORPH_TEXTURE_TECHNIQUE
+    and not MORPH_TEXTURE_AVAILABLE
+)
+
 run_button = st.button(
-    "Run Inspection", type="primary",
-    disabled=(len(images_to_process) == 0 or not YOLO_AVAILABLE),
+    "Run Inspection",
+    type="primary",
+    disabled=(
+        len(images_to_process) == 0
+        or not YOLO_AVAILABLE
+        or morph_texture_blocked
+    ),
 )
 if not YOLO_AVAILABLE and images_to_process:
     st.warning("Can't run — ultralytics (YOLO) isn't installed. See the sidebar for install instructions.")
@@ -3686,15 +4102,21 @@ if run_button:
                     img = calib.rectify_perspective(img, auto_quad)
             elif rectify_points is not None:
                 img = calib.rectify_perspective(img, rectify_points)
-        calibration_result = get_calibration(img)
-        out = inspect_image_yolo(
-            img,
-            calibration=calibration_result,
-            denoise_method=DENOISE_METHOD,
-            enhance_method=ENHANCE_METHOD,
-            erode_pixels=erode_pixels,
-            yolo_confidence=yolo_confidence,
-        )
+        if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+            # PEI WEN:
+            # Run the latest V12 YOLO + Geometry + Texture hybrid,
+            # NOT the old colorDetection pipeline.
+            out = inspect_image_morph_texture_v12(img)
+        else:
+            calibration_result = get_calibration(img)
+            out = inspect_image_yolo(
+                img,
+                calibration=calibration_result,
+                denoise_method=DENOISE_METHOD,
+                enhance_method=ENHANCE_METHOD,
+                erode_pixels=erode_pixels,
+                yolo_confidence=yolo_confidence,
+            )
         out["filename"] = name
         results.append(out)
 
