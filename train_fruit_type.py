@@ -3,12 +3,60 @@ import glob
 import json
 import os
 import random
+import re
 from collections import Counter, defaultdict
 
 import cv2
 import numpy as np
 
-from train_cnn_quality import CLASS_FOLDERS, _base_image_key, _build_model
+CLASS_FOLDERS = {
+    "freshapples":       ("Apple", "Fresh"),
+    "rottenapples":      ("Apple", "Rotten"),
+    "unripe apple":      ("Apple", "Unripe"),
+    "freshbanana":       ("Banana", "Fresh"),
+    "rottenbanana":      ("Banana", "Rotten"),
+    "unripe banana":     ("Banana", "Unripe"),
+    "freshoranges":      ("Orange", "Fresh"),
+    "rottenoranges":     ("Orange", "Rotten"),
+    "unripe orange":     ("Orange", "Unripe"),
+    "ripemango":         ("Mango", "Fresh"),
+    "rottonmango":       ("Mango", "Rotten"),
+    "unripemango":       ("Mango", "Unripe"),
+    "FreshStrawberry":   ("Strawberry", "Fresh"),
+    "RottenStrawberry":  ("Strawberry", "Rotten"),
+    "unripe strawberry": ("Strawberry", "Unripe"),
+}
+
+_AUG_PREFIX_RE = re.compile(
+    r"^(rotated_by_\d+_|translation_|saltandpepper_|salt_and_pepper_|vertical_flip_|horizontal_flip_|aug_)+",
+    re.IGNORECASE,
+)
+
+
+def _base_image_key(path):
+    name = os.path.basename(path)
+    stem, _ext = os.path.splitext(name)
+    prev = None
+    while prev != stem:
+        prev = stem
+        stem = _AUG_PREFIX_RE.sub("", stem)
+    return stem.lower()
+
+
+def _build_model(num_classes):
+    import torch.nn as nn
+    from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+
+    model = mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
+    for param in model.features[:-4].parameters():
+        param.requires_grad = False
+
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(in_features, num_classes),
+    )
+    return model
 
 
 TYPE_IMAGE_SIZE = int(os.environ.get("TYPE_CNN_IMAGE_SIZE", "224"))

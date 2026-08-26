@@ -159,8 +159,7 @@ def _load_color_knn_model(fruit_type, models_dir=COLOR_KNN_MODELS_DIR):
 
 def classify_quality_color_knn(crop_bgr, fruit_type, models_dir=COLOR_KNN_MODELS_DIR):
     """Colour Feature Extraction ripeness classifier: LAB+HSV colour moments -> KNN.
-    Independent of the CNN in train_cnn_quality.py -- uses only explicit colour
-    statistics, no raw pixels, shape, or texture."""
+    Uses only explicit colour statistics, no raw pixels, shape, or texture."""
     scaler, model, classes = _load_color_knn_model(fruit_type, models_dir)
     if scaler is None or crop_bgr is None or crop_bgr.size == 0:
         return None, 0.0, {}
@@ -979,7 +978,7 @@ def inspect_image_yolo(
 
             raw_isolated_crop = crop_object(original, det, isolate=True)
 
-            yolo_species = yolo_label.capitalize()  # "apple" -> "Apple", matches train_cnn_quality.py's convention
+            yolo_species = yolo_label.capitalize()  # "apple" -> "Apple", matches train_fruit_type.py's convention
             type_label, type_conf, type_probs = classify_fruit_type_cnn(raw_isolated_crop)
             if FRUIT_DEBUG and type_probs:
                 probs_str = ", ".join(f"{k}={v:.3f}" for k, v in sorted(type_probs.items(), key=lambda kv: -kv[1]))
