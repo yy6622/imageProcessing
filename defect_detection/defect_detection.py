@@ -1004,10 +1004,20 @@ def detect_banana_defect(roi):
     # ======================================================
     #
     # DISPLAY-ONLY cleanup:
-    # Keep the defect percentage above unchanged, but do not draw
-    # red contours directly on the outer banana edge / crop-contact
-    # shadow. This makes the red outline point to damaged peel rather
-    # than the banana silhouette itself.
+    #
+    # IMPORTANT:
+    # Do NOT contour a defect mask AFTER clipping it with an inner
+    # fruit mask. Doing that creates a new artificial contour exactly
+    # along the inner clipping boundary, which is why a long red line
+    # still appeared parallel to the banana outline.
+    #
+    # Instead:
+    # 1. Find contours from the ORIGINAL defect mask.
+    # 2. Draw those contour lines into a temporary line mask.
+    # 3. Remove only contour pixels that are too close to the banana
+    #    outer boundary.
+    #
+    # The defect percentage is NOT changed.
 
     output = roi.copy()
 
@@ -1019,9 +1029,6 @@ def detect_banana_defect(roi):
 
     h, w = fruit_mask.shape
 
-    # Stronger display-only boundary protection.
-    # This removes red contours that still follow the banana outline,
-    # tip, stem edge, and overlap/contact boundary.
     display_margin = max(
         10,
         int(min(h, w) * 0.055)
@@ -1035,36 +1042,40 @@ def detect_banana_defect(roi):
         display_distance >= display_margin
     ] = 255
 
-    display_defect_mask = cv.bitwise_and(
+    # Draw ORIGINAL defect contour lines first.
+    contour_line_mask = np.zeros_like(
+        defect_mask
+    )
+
+    original_defect_contours, _ = cv.findContours(
         defect_mask,
-        display_inner_mask
-    )
-
-    # Light cleanup only for display. Do not change defect_percentage.
-    display_defect_mask = cv.morphologyEx(
-        display_defect_mask,
-        cv.MORPH_OPEN,
-        np.ones((3, 3), np.uint8),
-        iterations=1
-    )
-
-    display_contours, _ = cv.findContours(
-        display_defect_mask,
         cv.RETR_EXTERNAL,
         cv.CHAIN_APPROX_SIMPLE
     )
 
-    for contour in display_contours:
+    for contour in original_defect_contours:
 
         if cv.contourArea(contour) > 60:
 
             cv.drawContours(
-                output,
+                contour_line_mask,
                 [contour],
                 -1,
-                (0, 0, 255),
+                255,
                 2
             )
+
+    # Remove only the red LINE pixels near the fruit boundary.
+    # This avoids creating a new artificial red line at the clipping
+    # boundary while preserving genuine internal defect boundaries.
+    contour_line_mask = cv.bitwise_and(
+        contour_line_mask,
+        display_inner_mask
+    )
+
+    output[
+        contour_line_mask > 0
+    ] = (0, 0, 255)
 
 
     return (
@@ -5231,6 +5242,71 @@ def detect_mango_defect(roi):
     )
 
     # ------------------------------------------------------
+    # Dense black-spot / anthracnose-like clusters
+    # ------------------------------------------------------
+    #
+    # Mango peel can contain tiny natural lenticels, so single dots
+    # should not automatically count as defects. However, when many
+    # dark spots occur close together, they form a meaningful damaged
+    # region. Detect the local DENSITY of dark spots instead of
+    # accepting every individual dot.
+
+    dark_spot_seed = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    dark_spot_seed[
+        (value < 145)
+        & (dark_difference > 10)
+    ] = 255
+
+    dark_spot_seed = cv.bitwise_and(
+        dark_spot_seed,
+        inner_mask
+    )
+
+    # Estimate local dark-spot density.
+    density = cv.blur(
+        dark_spot_seed,
+        (31, 31)
+    )
+
+    dense_spot_region = np.zeros_like(
+        dark_spot_seed
+    )
+
+    # Roughly >= 8% dark pixels in the local neighbourhood.
+    dense_spot_region[
+        density >= 20
+    ] = 255
+
+    dense_spot_region = cv.bitwise_and(
+        dense_spot_region,
+        inner_mask
+    )
+
+    # Join nearby dense spot groups into visible damaged patches.
+    dense_spot_region = cv.morphologyEx(
+        dense_spot_region,
+        cv.MORPH_CLOSE,
+        np.ones((7, 7), np.uint8),
+        iterations=2
+    )
+
+    dense_spot_region = cv.morphologyEx(
+        dense_spot_region,
+        cv.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    dense_spot_region = cv.bitwise_and(
+        dense_spot_region,
+        inner_mask
+    )
+
+    # ------------------------------------------------------
     # Pale / gray mould
     # Require rough texture so normal highlights are reduced.
     # ------------------------------------------------------
@@ -5292,6 +5368,11 @@ def detect_mango_defect(roi):
     defect_mask = cv.bitwise_or(
         defect_mask,
         black_mask
+    )
+
+    defect_mask = cv.bitwise_or(
+        defect_mask,
+        dense_spot_region
     )
 
     defect_mask = cv.bitwise_or(
@@ -5403,8 +5484,31 @@ def detect_mango_defect(roi):
     # ------------------------------------------------------
     # Draw defects
     # ------------------------------------------------------
+    #
+    # DISPLAY-ONLY boundary cleanup:
+    # Draw contours from the real defect mask, then remove only the
+    # contour-line pixels that sit too close to the mango outer edge.
+    # This avoids a false red line at the top/outer fruit boundary.
+    # Defect percentage is NOT changed here.
 
     output = roi.copy()
+
+    display_margin = max(
+        8,
+        int(min(h, w) * 0.035)
+    )
+
+    display_inner_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    display_inner_mask[
+        distance >= display_margin
+    ] = 255
+
+    contour_line_mask = np.zeros_like(
+        defect_mask
+    )
 
     contours, _ = cv.findContours(
         defect_mask,
@@ -5417,12 +5521,21 @@ def detect_mango_defect(roi):
         if cv.contourArea(contour) >= min_area:
 
             cv.drawContours(
-                output,
+                contour_line_mask,
                 [contour],
                 -1,
-                (0, 0, 255),
+                255,
                 2
             )
+
+    contour_line_mask = cv.bitwise_and(
+        contour_line_mask,
+        display_inner_mask
+    )
+
+    output[
+        contour_line_mask > 0
+    ] = (0, 0, 255)
 
     return (
         output,

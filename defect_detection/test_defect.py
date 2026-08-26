@@ -28,7 +28,7 @@ from segmentation import (
 )
 
 
-IMAGE_PATH = CURRENT_DIR / "rotten_strawberry.png"
+IMAGE_PATH = CURRENT_DIR / "unripe_apple.png"
 
 MODEL_PATH = (
     PROJECT_ROOT
