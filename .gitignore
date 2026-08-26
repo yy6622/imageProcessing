@@ -3,4 +3,11 @@ __pycache__/
 *.pyc
 
 # Raw training images (1.4GB+) — too large for git, not source
-dataset/train/
+dataset/train/.venv_app/
+runs/
+*.zip
+*.pt
+*.keras
+.venv_app/
+runs/
+*.zip

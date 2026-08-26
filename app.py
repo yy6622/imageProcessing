@@ -12,8 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import calibration as calib
-from colorDetection import inspect_image_yolo, classify_fruit_type_cnn
-from segmentation import contour_shape_metrics, segment_all_objects
+from colorDetection import inspect_image_yolo
 import report as report_mod
 
 
@@ -3221,9 +3220,11 @@ def summary_to_text(summary):
 st.sidebar.title("Inspection Settings")
 
 IMPLEMENTED_TECHNIQUE = "Colour Feature Extraction"
+MORPH_TEXTURE_TECHNIQUE = "Morphological and Texture Feature Extraction"
+
 TECHNIQUE_OPTIONS = [
     IMPLEMENTED_TECHNIQUE,
-    "Morphological and Texture Feature Extraction",
+    MORPH_TEXTURE_TECHNIQUE,
     "Defect Detection",
     "Stem Detection",
     "All of the above",
@@ -3232,35 +3233,15 @@ selected_technique = st.sidebar.selectbox(
     "Technique / method (report section)",
     TECHNIQUE_OPTIONS,
     index=0,
-    help="Matches the report's methodology sections. Only Colour Feature "
-         "Extraction is implemented in this app (LAB chroma-distance "
-         "segmentation + YOLO + CNN) — the others are placeholders for "
-         "teammates' modules and don't change what actually runs below.",
+    help="Matches the report's methodology sections. Colour Feature Extraction "
+         "and Morphological and Texture Feature Extraction are connected to their "
+         "respective pipelines. Other teammate modules keep their existing behaviour.",
 )
-if selected_technique not in (
-    IMPLEMENTED_TECHNIQUE,
-    "Stem Detection",
-    "Defect Detection",
-):
+if selected_technique not in (IMPLEMENTED_TECHNIQUE, "Stem Detection"):
     st.sidebar.caption(
         f"ℹ️ “{selected_technique}” isn't implemented in this module yet — "
         f"running the same {IMPLEMENTED_TECHNIQUE} pipeline (LAB + YOLO + CNN) below."
     )
-
-if selected_technique == "Defect Detection":
-    if CUSTOM_MODULES_AVAILABLE:
-        st.sidebar.success(
-            "Exact latest defect pipeline loaded"
-        )
-    else:
-        st.sidebar.error(
-            "Defect detection module unavailable"
-        )
-
-        if CUSTOM_MODULE_ERROR:
-            st.sidebar.caption(
-                CUSTOM_MODULE_ERROR
-            )
 
 # ======================================================
 # Stem Detection — self-contained section, runs instead of the Colour
@@ -3698,104 +3679,22 @@ if run_button:
     results = []
     progress = st.progress(0.0, text="Running pipeline...")
     for i, (name, img) in enumerate(images_to_process):
-
-        # ==================================================
-        # TIFANY — EXACT LATEST DEFECT TEST
-        # ==================================================
-        if selected_technique == "Defect Detection":
-
-            try:
-                console_buffer = io.StringIO()
-
-                with contextlib.redirect_stdout(
-                    console_buffer
-                ):
-                    latest_result = (
-                        run_exact_latest_defect_pipeline(
-                            img
-                        )
-                    )
-
-                console_log = (
-                    console_buffer.getvalue()
-                )
-
-                parsed_objects = (
-                    parse_exact_defect_console(
-                        console_log
-                    )
-                )
-
-                out = {
-                    "original": latest_result["original"],
-                    "annotated": latest_result["annotated"],
-                    "objects": parsed_objects,
-                    "count": latest_result["count"],
-                    "summary": {},
-                    "calibration_method": "not used",
-                    "calibration_confidence": "not used",
-                    "exact_defect_console": console_log,
-                }
-
-            except Exception as exc:
-                st.error(
-                    f"Defect Detection failed: {exc}"
-                )
-
-                out = {
-                    "original": img,
-                    "annotated": img.copy(),
-                    "objects": [],
-                    "count": 0,
-                    "summary": {},
-                    "calibration_method": "not used",
-                    "calibration_confidence": "not used",
-                    "exact_defect_console": "",
-                }
-
-        # ==================================================
-        # FRIEND PIPELINE — unchanged
-        # ==================================================
-        else:
-            working_img = img
-
-            if want_rectify:
-                if rectify_mode.startswith("Auto"):
-                    auto_quad = (
-                        calib.detect_reference_quad(
-                            working_img
-                        )
-                    )
-
-                    if auto_quad is not None:
-                        working_img = (
-                            calib.rectify_perspective(
-                                working_img,
-                                auto_quad,
-                            )
-                        )
-
-                elif rectify_points is not None:
-                    working_img = (
-                        calib.rectify_perspective(
-                            working_img,
-                            rectify_points,
-                        )
-                    )
-
-            calibration_result = get_calibration(
-                working_img
-            )
-
-            out = inspect_image_yolo(
-                working_img,
-                calibration=calibration_result,
-                denoise_method=DENOISE_METHOD,
-                enhance_method=ENHANCE_METHOD,
-                erode_pixels=erode_pixels,
-                yolo_confidence=yolo_confidence,
-            )
-
+        if want_rectify:
+            if rectify_mode.startswith("Auto"):
+                auto_quad = calib.detect_reference_quad(img)
+                if auto_quad is not None:
+                    img = calib.rectify_perspective(img, auto_quad)
+            elif rectify_points is not None:
+                img = calib.rectify_perspective(img, rectify_points)
+        calibration_result = get_calibration(img)
+        out = inspect_image_yolo(
+            img,
+            calibration=calibration_result,
+            denoise_method=DENOISE_METHOD,
+            enhance_method=ENHANCE_METHOD,
+            erode_pixels=erode_pixels,
+            yolo_confidence=yolo_confidence,
+        )
         out["filename"] = name
         results.append(out)
 
@@ -3958,18 +3857,37 @@ if results:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Photos inspected", len(results))
     col2.metric("Fruits detected", len(all_objects))
-    fresh_n = sum(1 for o in all_objects if o.get("label") == "Fresh")
-    rotten_n = sum(1 for o in all_objects if o.get("label") == "Rotten")
-    col3.metric("Fresh", fresh_n)
-    col4.metric("Rotten", rotten_n)
+    if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+        classified_n = sum(1 for o in all_objects if o.get("fruit_type"))
+        sized_n = sum(
+            1
+            for o in all_objects
+            if o.get("size_class") not in (None, "Unknown")
+        )
+        col3.metric("Classified", classified_n)
+        col4.metric("Sized", sized_n)
+    else:
+        fresh_n = sum(1 for o in all_objects if o.get("label") == "Fresh")
+        rotten_n = sum(1 for o in all_objects if o.get("label") == "Rotten")
+        col3.metric("Fresh", fresh_n)
+        col4.metric("Rotten", rotten_n)
 
     chart_col1, chart_col2 = st.columns(2)
     fruit_type_counts = pd.Series([o.get("fruit_type") or "Unknown" for o in all_objects]).value_counts()
     chart_col1.caption("By fruit type")
     chart_col1.bar_chart(fruit_type_counts)
-    label_counts = pd.Series([o.get("label") or "Unclassified" for o in all_objects]).value_counts()
-    chart_col2.caption("By quality")
-    chart_col2.bar_chart(label_counts)
+    if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+        size_counts = pd.Series(
+            [o.get("size_class") or "Unknown" for o in all_objects]
+        ).value_counts()
+        chart_col2.caption("By size class")
+        chart_col2.bar_chart(size_counts)
+    else:
+        label_counts = pd.Series(
+            [o.get("label") or "Unclassified" for o in all_objects]
+        ).value_counts()
+        chart_col2.caption("By quality")
+        chart_col2.bar_chart(label_counts)
 
     st.subheader("Every fruit detected")
     table_rows = []
@@ -3983,6 +3901,7 @@ if results:
                 "Quality": obj.get("label") or "—",
                 "Quality Conf": f"{obj.get('confidence', 0) * 100:.1f}%" if obj.get("label") else "—",
                 "Wound %": f"{obj.get('defect_fraction', 0) * 100:.1f}%",
+                "Size Class": obj.get("size_class") or "—",
                 "Width (cm)": f"{obj['width_cm']:.2f}" if obj.get("width_cm") is not None else "—",
                 "Height (cm)": f"{obj['height_cm']:.2f}" if obj.get("height_cm") is not None else "—",
                 "Area (cm^2)": f"{obj['area_cm2']:.2f}" if obj.get("area_cm2") is not None else "—",
@@ -4024,18 +3943,42 @@ if results:
             st.markdown(f"**Separated fruit ({r['count']}):**")
             crop_cols = st.columns(len(r["objects"]))
             for obj, col in zip(r["objects"], crop_cols):
-                caption = f"#{obj['index'] + 1} {obj.get('fruit_type') or '?'} {obj.get('label') or '?'}"
-                col.image(bgr_to_rgb(obj["crop_isolated"]), caption=caption, width="stretch")
+                if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+                    caption = (
+                        f"#{obj['index'] + 1} "
+                        f"{obj.get('fruit_type') or '?'} "
+                        f"Size {obj.get('size_class') or '?'}"
+                    )
+                else:
+                    caption = (
+                        f"#{obj['index'] + 1} "
+                        f"{obj.get('fruit_type') or '?'} "
+                        f"{obj.get('label') or '?'}"
+                    )
+                col.image(
+                    bgr_to_rgb(obj["crop_isolated"]),
+                    caption=caption,
+                    width="stretch",
+                )
 
             for obj in r["objects"]:
                 st.markdown(f"**Fruit #{obj['index'] + 1}**")
                 cols = st.columns(4)
                 cls = obj.get("classification")
 
-                cols[0].write(f"Type: **{obj.get('fruit_type') or 'N/A'}** "
-                               f"({obj.get('fruit_type_confidence', 0) * 100:.0f}%)")
-                cols[1].write(f"Quality: **{obj.get('label') or 'N/A'}** "
-                               f"({obj.get('confidence', 0) * 100:.0f}%)")
+                cols[0].write(
+                    f"Type: **{obj.get('fruit_type') or 'N/A'}** "
+                    f"({obj.get('fruit_type_confidence', 0) * 100:.0f}%)"
+                )
+                if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+                    cols[1].write(
+                        f"Size class: **{obj.get('size_class') or 'Unknown'}**"
+                    )
+                else:
+                    cols[1].write(
+                        f"Quality: **{obj.get('label') or 'N/A'}** "
+                        f"({obj.get('confidence', 0) * 100:.0f}%)"
+                    )
                 if obj.get("width_cm") is not None:
                     cols[2].write(f"Size: {obj['width_cm']:.1f} × {obj['height_cm']:.1f} cm")
                     cols[3].write(f"Area: {obj['area_cm2']:.1f} cm²")
@@ -4045,6 +3988,50 @@ if results:
 
                 if cls is not None and cls.error:
                     st.caption(f"⚠️ {cls.error}")
+
+                if selected_technique == MORPH_TEXTURE_TECHNIQUE:
+                    with st.expander(
+                        f"Geometrical & texture features — Fruit #{obj['index'] + 1}"
+                    ):
+                        gf1, gf2, gf3 = st.columns(3)
+                        gf1.metric(
+                            "Aspect ratio",
+                            f"{obj.get('geo_aspect_ratio', 0):.3f}",
+                        )
+                        gf2.metric(
+                            "Circularity",
+                            f"{obj.get('geo_circularity', 0):.3f}",
+                        )
+                        gf3.metric(
+                            "Extent",
+                            f"{obj.get('geo_extent', 0):.3f}",
+                        )
+
+                        tf1, tf2, tf3 = st.columns(3)
+                        tf1.metric(
+                            "GLCM Contrast",
+                            f"{obj.get('tex_contrast', 0):.3f}",
+                        )
+                        tf2.metric(
+                            "GLCM Energy",
+                            f"{obj.get('tex_energy', 0):.3f}",
+                        )
+                        tf3.metric(
+                            "GLCM Homogeneity",
+                            f"{obj.get('tex_homogeneity', 0):.3f}",
+                        )
+
+                        st.caption(
+                            f"Texture entropy: {obj.get('tex_entropy', 0):.3f} | "
+                            f"Mean intensity: {obj.get('tex_mean_intensity', 0):.2f} | "
+                            f"Std intensity: {obj.get('tex_std_intensity', 0):.2f}"
+                        )
+                        st.caption(
+                            f"Classification source: "
+                            f"{obj.get('classification_method', 'N/A')} | "
+                            f"Size class: {obj.get('size_class', 'Unknown')}"
+                        )
+
                 st.divider()
 
             st.caption(f"Calibration: {r.get('calibration_method')} ({r.get('calibration_confidence')})")
