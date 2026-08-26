@@ -1,4 +1,6 @@
+.venv/
 __pycache__/
+runs/
 *.pyc
 
 # Raw training images (1.4GB+) — too large for git, not source
