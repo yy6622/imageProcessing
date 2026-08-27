@@ -301,6 +301,7 @@ class FruitResult:
     colour_confidence: float = 0.0
     defect_percentage: Optional[float] = None
     defect_note: str = ""
+    defect_marked_crop: Optional[np.ndarray] = None  # crop with the defect region(s) outlined, from defect_detection.py
     defect_ripeness: Optional[str] = None
     defect_ripeness_confidence: float = 0.0
     stem_detected: bool = False
@@ -644,6 +645,14 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
             if isinstance(defect_out, tuple) and len(defect_out) >= 1:
                 numeric = [v for v in defect_out if isinstance(v, (int, float))]
                 result.defect_percentage = float(numeric[-1]) if numeric else None
+                # The first element is the crop with defect region(s) outlined in
+                # red -- same shape/dtype as raw_crop_bgr -- keep it for display.
+                images = [
+                    v for v in defect_out
+                    if isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[2] == 3
+                ]
+                if images:
+                    result.defect_marked_crop = images[0]
             elif isinstance(defect_out, (int, float)):
                 result.defect_percentage = float(defect_out)
             else:

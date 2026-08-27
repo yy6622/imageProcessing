@@ -745,12 +745,16 @@ else:
                 size_cm = fruit_size_cm(fr, r)
                 if size_cm is not None:
                     st.caption(f"📏 {size_cm[0]:.1f} x {size_cm[1]:.1f} cm (area {size_cm[2]:.1f} cm²)")
+            images = [(fr.crop, f"{fr.species or '?'}")]
+            if fr.defect_marked_crop is not None:
+                images.append((fr.defect_marked_crop, "Defect marked"))
             if fr.stem_crop is not None:
-                img_col, stem_col = st.columns(2)
-                img_col.image(bgr_to_rgb(fr.crop), caption=f"{fr.species or '?'}", width=180)
-                stem_col.image(bgr_to_rgb(fr.stem_crop), caption="Stem detection", width=180)
+                images.append((fr.stem_crop, "Stem detection"))
+            if len(images) == 1:
+                st.image(bgr_to_rgb(images[0][0]), caption=images[0][1], width=200)
             else:
-                st.image(bgr_to_rgb(fr.crop), caption=f"{fr.species or '?'}", width=200)
+                for img_col, (img, caption) in zip(st.columns(len(images)), images):
+                    img_col.image(bgr_to_rgb(img), caption=caption, width=180)
 
             st.markdown(
                 f"**Species:** {fr.species} ({fr.species_confidence*100:.0f}%) "
