@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from overall import run_overall_pipeline, DEFAULT_IMAGE_SIZE, BOX_COLOURS, draw_annotations  # adds common/ to sys.path
+from overall import run_overall_pipeline, BOX_COLOURS, draw_annotations  # adds common/ to sys.path
 import calibration as calib          # common/calibration.py
 import pdf_report as report_module   # common/pdf_report.py
 
@@ -256,17 +256,6 @@ st.markdown(
       .st-key-upload_dropzone [data-testid="stFileUploaderDropzone"] button svg {
         fill:#fff !important;
       }
-      /* "Take Photo" trigger button -- same green pill as the Upload button
-         above it, so the two read as one matching pair. */
-      .st-key-camera_trigger { margin-top:.6rem; }
-      .st-key-camera_trigger button {
-        border:0 !important; border-radius:10px !important;
-        background:linear-gradient(180deg,#216d49,#155a3a) !important;
-        color:#fff !important; font-weight:700 !important;
-      }
-      .st-key-camera_trigger button:hover {
-        background:linear-gradient(180deg,#1c5f3f,#0f492f) !important;
-      }
       .fq-thumb-row { gap:14px; padding:1.15rem 0 .15rem; }
       .fq-thumb { border-radius:14px; border:3px solid #fff; box-shadow:0 4px 14px rgba(33,62,42,.15); }
       .fq-thumb-badge { width:25px; height:25px; top:6px; right:6px; border:2px solid white; background:#138448; font-size:.72rem; }
@@ -464,10 +453,10 @@ with st.sidebar.expander("🔒  Calibration" if not want_measurements else "▣ 
     manual_cm_per_pixel = None
     if want_measurements:
         manual_cm_per_pixel = st.number_input(
-            "cm per pixel (measured against your ORIGINAL uploaded photo, not the resized copy)",
+            "cm per pixel (measured against your uploaded photo)",
             value=0.02, min_value=0.0001, step=0.001, format="%.4f",
             help="Known scale for your camera setup (e.g. derived once from a ruler photo). "
-                 "The app auto-adjusts this for the internal 512x512 resize.",
+                 "The analysis pipeline now keeps the original image resolution.",
         )
     else:
         st.caption("Turn on \"Measure physical size\" above to unlock this.")
@@ -536,22 +525,6 @@ if st.session_state["view"] == "upload":
             "Select one or more images", type=["jpg", "jpeg", "png", "bmp"],
             accept_multiple_files=True, label_visibility="collapsed",
         )
-        uploaded_files = list(uploaded_files) if uploaded_files else []
-
-        if "fq_show_camera" not in st.session_state:
-            st.session_state["fq_show_camera"] = False
-
-        with st.container(key="camera_trigger"):
-            if st.button("📷  Take Photo", key="fq_camera_toggle"):
-                st.session_state["fq_show_camera"] = not st.session_state["fq_show_camera"]
-
-        if st.session_state["fq_show_camera"]:
-            camera_photo = st.camera_input(
-                "Take a photo", key="fq_camera_input", label_visibility="collapsed",
-            )
-            if camera_photo is not None:
-                uploaded_files.append(camera_photo)
-
         if uploaded_files:
             thumbs = "".join(bgr_to_thumb_html(read_upload_to_bgr(f), size=124) for f in uploaded_files)
             st.markdown(f'<div class="fq-thumb-row">{thumbs}</div>', unsafe_allow_html=True)
@@ -580,14 +553,11 @@ if st.session_state["view"] == "upload":
                 elif rectify_points is not None:
                     img = calib.rectify_perspective(img, rectify_points)
 
-            # run_overall_pipeline resizes to DEFAULT_IMAGE_SIZE internally, so
-            # every fr.bbox it returns is in THAT pixel space, not the original
-            # upload's. cm_per_pixel above was measured against the original
-            # photo -- scale it by the resize ratio so cm figures stay correct
-            # regardless of the fixed internal working resolution.
-            orig_h, orig_w = img.shape[:2]
-            scale_x = orig_w / DEFAULT_IMAGE_SIZE[0]
-            scale_y = orig_h / DEFAULT_IMAGE_SIZE[1]
+            # The overall pipeline now runs at the uploaded image's original
+            # resolution, so returned bounding boxes stay in the same pixel
+            # coordinate space as the uploaded image.
+            scale_x = 1.0
+            scale_y = 1.0
 
             fruit_results, display_img = run_overall_pipeline(img)
             all_results.append({
@@ -778,24 +748,26 @@ else:
             if fr.stem_crop is not None:
                 images.append((fr.stem_crop, "Stem detection"))
             if len(images) == 1:
-                st.image(bgr_to_rgb(images[0][0]), caption=images[0][1], width="stretch")
+                st.image(bgr_to_rgb(images[0][0]), caption=images[0][1], width=200)
             else:
                 for img_col, (img, caption) in zip(st.columns(len(images)), images):
-                    # "stretch" fits each thumbnail to its own sub-column instead of a
-                    # fixed pixel width -- a fixed width was wider than the actual
-                    # rendered column once 3 fruit-cards x up to 3 images each were on
-                    # screen, so thumbnails spilled outside their box into the next card.
-                    img_col.image(bgr_to_rgb(img), caption=caption, width="stretch")
+                    img_col.image(bgr_to_rgb(img), caption=caption, width=180)
 
             st.markdown(
                 f"**Species:** {fr.species} ({fr.species_confidence*100:.0f}%) "
                 f"&mdash; won by: `{fr.species_source}`", unsafe_allow_html=True,
             )
             st.caption(
-                f"1) YOLO+CNN: {fr.own_species} ({fr.own_confidence*100:.0f}%)  |  "
-                f"2) YOLO raw: {fr.yolo_species} ({fr.yolo_confidence*100:.0f}%)  |  "
+                f"1) YOLO: {fr.yolo_species or 'no result'} "
+                f"({fr.yolo_confidence*100:.0f}%)  |  "
+                f"2) CNN + Rules: {fr.cnn_rule_species or 'no result'} "
+                f"({fr.cnn_rule_confidence*100:.0f}%)  |  "
                 f"3) Morph: {fr.morph_fruit_type or 'no match'}"
-                + (f" ({fr.morph_fruit_type_confidence*100:.0f}%)" if fr.morph_fruit_type else "")
+                + (
+                    f" ({fr.morph_fruit_type_confidence*100:.0f}%)"
+                    if fr.morph_fruit_type
+                    else ""
+                )
             )
             #st.caption(f"CNN raw guess (feeds into #1): {fr.cnn_species} ({fr.cnn_confidence*100:.0f}%)")
 

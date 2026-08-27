@@ -1,7 +1,7 @@
 
 """
 Overall analysis orchestrator -- ties the independently-built modules
-(colour, fruit type, defect, stem; morphological is not implemented yet)
+(colour, fruit type, defect, stem, morphological/texture)
 together into one combined per-fruit result.
 
 This file is NEW integration code written for the "overall" system. It does
@@ -40,10 +40,10 @@ from segmentation import (                                     # common/
     contour_shape_metrics,
     compute_texture_roughness,
 )
-import train_color_knn as color_knn_module                     # colour/
-import train_fruit_type as fruit_type_module                   # fruit_type/
-import defect_detection                                        # defect/
-import ripeness_detection                                      # defect/ (defect's own ripeness rule)
+from colour import train_color_knn as color_knn_module
+from fruit_type import train_fruit_type as fruit_type_module
+from defect.defect_detection import detect_defect
+from defect.ripeness_detection import classify_ripeness                                      # defect/ (defect's own ripeness rule)
 from stem.detector import StemDetector                         # stem/ (package)
 
 try:
@@ -52,7 +52,7 @@ try:
     # entirely, matching ASS's current app.py (which no longer imports
     # morph_texture_module at all). Aliased to the old name so every
     # downstream reference below keeps working unchanged.
-    import morph_v12_bridge as morph_texture_module              # morphological/
+    from morphological import morph_v12_bridge as morph_texture_module
     _MORPH_IMPORT_ERROR = None
 except Exception as _morph_import_exc:                          # pragma: no cover
     morph_texture_module = None
@@ -80,7 +80,7 @@ DEFAULT_IMAGE_SIZE = (512, 512)
 # Applied AFTER choose_cnn_override, only if species is still Apple/Banana
 # (i.e. the CNN did not override it to Mango/Strawberry). No extra floor for
 # Orange -- a badly rotten orange may legitimately score lower confidence.
-APPLE_MIN_CONF = 0.85
+APPLE_MIN_CONF = 0.65
 BANANA_MIN_CONF = 0.55
 
 # choose_cnn_override: four independent Strawberry acceptance rules (normal /
@@ -126,7 +126,27 @@ DUPLICATE_FRAGMENT_MAX_AREA_RATIO = 0.35
 # Drop boxes smaller than this fraction of the whole image as noise.
 MIN_BOX_AREA_RATIO = 0.002
 
-FALLBACK_ONLY_SPECIES = {"Mango", "Strawberry"}
+# Segmentation fallback can recover ANY supported fruit if whole-image YOLO
+# misses it. Native YOLO species use a stricter CNN/morph confidence gate below.
+FALLBACK_ONLY_SPECIES = {"Apple", "Banana", "Orange", "Mango", "Strawberry"}
+FALLBACK_NATIVE_MIN_CNN_CONF = 0.80
+FALLBACK_NATIVE_MIN_MORPH_CONF = 0.60
+
+# Species that can participate in the independent 3-way species vote.
+# YOLO itself only knows Apple/Banana/Orange, while the CNN/rule candidate
+# and Morph V12 may also identify Mango/Strawberry.
+VALID_SPECIES = {"Apple", "Banana", "Orange", "Mango", "Strawberry"}
+YOLO_NATIVE_SPECIES = {"Apple", "Banana", "Orange"}
+
+# High-confidence native YOLO protection.
+#
+# fruit_yolo_v4 was specifically trained for Apple/Banana/Orange. When it is
+# extremely confident about one of those native classes, a Mango/Strawberry
+# majority is allowed to overturn it only when BOTH alternative voters are
+# also extremely confident. This prevents a green/unripe Orange from becoming
+# Mango simply because CNN + morphology both react to its green colour/shape.
+NATIVE_YOLO_LOCK_CONF = 0.95
+NON_NATIVE_OVERRIDE_MIN_CONF = 0.95
 
 DEFECT_SUPPORTED_SPECIES = {"Apple", "Banana", "Orange", "Mango", "Strawberry"}  # defect_detection.py's dispatcher now covers all 5
 
@@ -293,6 +313,13 @@ class FruitResult:
     yolo_confidence: float = 0.0
     cnn_species: Optional[str] = None
     cnn_confidence: float = 0.0
+    raw_cnn_species: Optional[str] = None
+    raw_cnn_confidence: float = 0.0
+    cnn_rule_species: Optional[str] = None
+    cnn_rule_confidence: float = 0.0
+    cnn_rule_reason: str = ""
+    # Legacy names kept because app.py/report.py may already display them.
+    # They now represent the FULL CNN/rule vote (not YOLO+CNN fused together).
     own_species: Optional[str] = None
     own_confidence: float = 0.0
     morph_fruit_type: Optional[str] = None
@@ -323,137 +350,503 @@ class FruitResult:
     quality_note: str = ""
 
 
-def _classify_species(crop_bgr, yolo_label, yolo_conf, local_contour, morph_species=None, morph_confidence=0.0):
-    """
-    Species is decided by THREE independent algorithms, each reported with
-    its own percentage, and decided by MAJORITY VOTE across them (not just
-    "take the highest confidence" -- explicit instruction):
-
-      1. "own"  -- fruit_yolo_v4 + the CNN (train_fruit_type), fused via the
-         tuned choose_cnn_override/KNOWN_CLASS_OVERRIDE gates ported from
-         ASS's app.py. This pair stays fused as ONE candidate, not split
-         apart into two raw numbers, because it is already-integrated
-         tuning of our own system, not a comparison against someone else's
-         separate algorithm.
-      2. "yolo_raw" -- fruit_yolo_v4's own raw guess/confidence on its own,
-         kept as a separate candidate too (per explicit instruction) in case
-         the fused/overridden "own" result ends up lower-confidence than
-         plain YOLO would have been by itself.
-      3. "morph" -- the teammate's independent morphological/texture module
-         (V12: its own YOLO + pure geometry/texture feature classifier,
-         fused internally with an agreement-aware Unknown guard). A
-         genuinely separate algorithm, compared like "yolo_raw", not
-         folded into "own".
-
-    Whichever species label at least 2 of the (up to 3) candidates agree on
-    wins, using the highest confidence among the agreeing candidates. Only
-    when all candidates disagree (no majority possible) does it fall back
-    to the single highest-confidence candidate, since that is the only
-    signal left to break a 3-way (or 1-vs-1) tie.
-    """
+def _predict_type_candidate(image_bgr):
+    """Run the current five-class fruit-type CNN and return label/conf/probs."""
     model, classes = _load_type_model()
-    type_label, type_conf, _probs = fruit_type_module.predict_fruit_type_with_probs(model, classes, crop_bgr)
+    return fruit_type_module.predict_fruit_type_with_probs(model, classes, image_bgr)
 
-    yolo_species, yolo_confidence = yolo_label.capitalize(), yolo_conf
-    own_species, own_confidence = yolo_species, yolo_confidence
 
-    roi_h, roi_w = crop_bgr.shape[:2]
+def _contained_strawberry_evidence(bbox_xyxy, verified_strawberry_blobs):
+    """Return strong Strawberry evidence contained in this YOLO box.
+
+    Ported from test_defect.py's large-Orange/Strawberry-fragment check. The
+    evidence is used only by the CNN/rule species candidate; it is not counted
+    as an extra vote of its own.
+    """
+    if not bbox_xyxy or not verified_strawberry_blobs:
+        return []
+
+    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+    evidence_inside = []
+    for evidence in verified_strawberry_blobs:
+        ex1, ey1, ex2, ey2 = evidence["bbox"]
+        evidence_area = max(1, (ex2 - ex1) * (ey2 - ey1))
+        ix1, iy1 = max(x1, ex1), max(y1, ey1)
+        ix2, iy2 = min(x2, ex2), min(y2, ey2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        contained_ratio = (iw * ih) / evidence_area
+        if contained_ratio >= 0.80:
+            evidence_inside.append(evidence)
+    return evidence_inside
+
+
+def _build_cnn_rule_candidate(
+    crop_bgr,
+    raw_crop_bgr,
+    yolo_species,
+    yolo_confidence,
+    local_contour,
+    raw_mask=None,
+    bbox_xyxy=None,
+    verified_strawberry_blobs=None,
+):
+    """Build ONE independent CNN/rule vote using the complete test_defect logic.
+
+    Important: this is deliberately separate from the raw YOLO vote. The
+    candidate starts from the five-class CNN, then applies the tested
+    Strawberry/Mango correction rules (processed CNN + raw-ROI CNN + colour +
+    shape + fragment evidence). That prevents YOLO from being counted twice in
+    the final majority vote.
+    """
+    type_label, type_conf, type_probs = _predict_type_candidate(crop_bgr)
+
+    raw_cnn_type, raw_cnn_conf, raw_probs = None, 0.0, {}
+    if raw_crop_bgr is not None and raw_crop_bgr.size > 0:
+        try:
+            raw_cnn_type, raw_cnn_conf, raw_probs = _predict_type_candidate(raw_crop_bgr)
+        except Exception as exc:  # keep processed CNN usable if raw check fails
+            _dbg(f"_build_cnn_rule_candidate: raw-ROI CNN error: {exc}")
+
+    measure_roi = raw_crop_bgr if raw_crop_bgr is not None and raw_crop_bgr.size > 0 else crop_bgr
+    roi_h, roi_w = measure_roi.shape[:2]
     aspect, circularity = get_shape_values(local_contour, roi_w, roi_h)
-    red_ratio = calculate_red_ratio(crop_bgr)
+    red_ratio = calculate_red_ratio(measure_roi, raw_mask)
 
-    override = choose_cnn_override(yolo_confidence, type_label, type_conf, aspect, circularity, red_ratio)
-    if override == "strawberry":
-        own_species, own_confidence = "Strawberry", type_conf
-    elif override == "mango":
-        own_species, own_confidence = "Mango", type_conf
-    elif (
-        type_label in ("Apple", "Banana", "Orange")
-        and type_label != yolo_species
-        and type_conf >= KNOWN_CLASS_OVERRIDE_MIN_CNN_CONF
-        and (type_conf - yolo_confidence) >= KNOWN_CLASS_OVERRIDE_MIN_GAP
+    # Native Orange consensus guard:
+    # if YOLO + processed CNN + raw-ROI CNN all agree that this is Orange,
+    # do not let shape-only/low-red Mango fallback rules overturn that
+    # three-source Orange evidence. This is especially important for
+    # green/unripe oranges, which naturally have very low red_ratio and can
+    # become elongated/non-circular when a leaf enters the crop.
+    native_orange_consensus = (
+        yolo_species == "Orange"
+        and type_label == "Orange"
+        and raw_cnn_type == "Orange"
+    )
+
+    rule_species = None
+    rule_confidence = 0.0
+    rule_reason = "no_safe_cnn_candidate"
+
+    # ------------------------------------------------------------------
+    # Base independent CNN candidate.
+    # Apple/Banana/Orange are native, direct five-class CNN outputs.
+    # Mango/Strawberry must pass the same safety gates used in test_defect.py.
+    # ------------------------------------------------------------------
+    basic_override = choose_cnn_override(
+        yolo_confidence, type_label, type_conf, aspect, circularity, red_ratio
+    )
+
+    if type_label in YOLO_NATIVE_SPECIES:
+        rule_species = type_label
+        rule_confidence = float(type_conf)
+        rule_reason = "processed_cnn"
+    elif basic_override == "strawberry":
+        rule_species = "Strawberry"
+        rule_confidence = float(type_conf)
+        rule_reason = "processed_cnn_strawberry_safety_gate"
+    elif basic_override == "mango":
+        rule_species = "Mango"
+        rule_confidence = float(type_conf)
+        rule_reason = "processed_cnn_mango_safety_gate"
+
+    # When both CNN views agree, keep the stronger confidence for this one
+    # CNN/rule vote. This is still ONE vote, not two.
+    if raw_cnn_type == rule_species and raw_cnn_conf > rule_confidence:
+        rule_confidence = float(raw_cnn_conf)
+        rule_reason += "+raw_roi_agreement"
+
+    # Known-class disagreement: let a very strong raw-ROI CNN replace the
+    # processed-CNN known class only when it is clearly stronger.
+    if (
+        raw_cnn_type in YOLO_NATIVE_SPECIES
+        and rule_species in YOLO_NATIVE_SPECIES
+        and raw_cnn_type != rule_species
+        and raw_cnn_conf >= KNOWN_CLASS_OVERRIDE_MIN_CNN_CONF
+        and (raw_cnn_conf - rule_confidence) >= KNOWN_CLASS_OVERRIDE_MIN_GAP
     ):
-        # NOT part of the ASS port -- YOLO knows these 3 classes natively, but
-        # can still misidentify one as another (e.g. a green Apple boxed as
-        # Orange). Only override when the CNN is both very confident AND
-        # clearly beats YOLO's own confidence, not on a marginal disagreement.
-        own_species, own_confidence = type_label, type_conf
-        override = f"known_class:{type_label.lower()}"
+        rule_species = raw_cnn_type
+        rule_confidence = float(raw_cnn_conf)
+        rule_reason = "raw_roi_known_class_override"
 
-    _dbg(f"_classify_species: yolo={yolo_species}({yolo_confidence:.3f}) cnn={type_label}({type_conf:.3f}) "
-         f"aspect={aspect:.3f} circularity={'n/a' if circularity is None else f'{circularity:.3f}'} "
-         f"red_ratio={red_ratio:.3f} -> override={override} own={own_species}({own_confidence:.3f})")
-    if type_label == "Mango" and override != "mango":
-        _dbg(f"_classify_species: Mango REJECTED -- needs cnn_conf>={MANGO_MIN_CONF} (got {type_conf:.3f}), "
-             f"aspect>={MANGO_MIN_ASPECT} (got {aspect:.3f}), "
-             f"circularity<{MANGO_MAX_CIRCULARITY} (got {'n/a' if circularity is None else f'{circularity:.3f}'})")
+    # ------------------------------------------------------------------
+    # Complete special-case rules ported from test_defect.py.
+    # These modify the ONE CNN/rule vote; they never create extra votes.
+    # ------------------------------------------------------------------
 
-    # Strawberry exception (explicit instruction): fruit_yolo_v4 never learned
-    # Strawberry natively, and morph_texture_module's own YOLO can be shaky on
-    # it too -- once the tuned choose_cnn_override strawberry gate (four
-    # sub-rules: normal/strong-red/green-unripe/damaged) has already decided
-    # "own" IS a Strawberry, trust that directly and skip the majority vote,
-    # instead of letting a less-reliable morph guess pull it away again.
-    if own_species == "Strawberry":
-        species, confidence, source = own_species, own_confidence, "own_strawberry_priority"
-        _dbg(f"_classify_species: own={own_species}({own_confidence:.3f}) is Strawberry -- "
-             f"skipping majority vote, using own directly (source={source})")
-        return {
-            "species": species,
-            "species_confidence": confidence,
-            "species_source": source,
-            "yolo_species": yolo_species,
-            "yolo_confidence": yolo_confidence,
-            "cnn_species": type_label,
-            "cnn_confidence": type_conf,
-            "own_species": own_species,
-            "own_confidence": own_confidence,
-            "morph_species": morph_species,
-            "morph_confidence": morph_confidence,
-        }
+    # GREEN STRAWBERRY / WEAK ORANGE SPECIAL CASE
+    if (
+        yolo_species == "Orange"
+        and yolo_confidence < 0.70
+        and type_label == "Strawberry"
+        and type_conf >= 0.975
+        and raw_cnn_type == "Strawberry"
+        and raw_cnn_conf >= 0.995
+        and red_ratio <= 0.10
+        and aspect >= 1.15
+        and circularity is not None
+        and circularity < 0.76
+    ):
+        rule_species = "Strawberry"
+        rule_confidence = float(max(type_conf, raw_cnn_conf))
+        rule_reason = "green_strawberry_weak_orange"
 
-    candidates = [
-        ("own", own_species, own_confidence),
-        ("yolo_raw", yolo_species, yolo_confidence),
-    ]
+    # DAMAGED STRAWBERRY / APPLE OVERRIDE
+    if (
+        yolo_species == "Apple"
+        and type_label == "Strawberry"
+        and type_conf >= 0.90
+        and raw_cnn_type == "Strawberry"
+        and raw_cnn_conf >= 0.99
+        and 0.15 <= red_ratio < 0.70
+        and aspect >= 1.15
+        and circularity is not None
+        and circularity < 0.72
+    ):
+        rule_species = "Strawberry"
+        rule_confidence = float(max(type_conf, raw_cnn_conf))
+        rule_reason = "damaged_strawberry_apple_override"
+
+    # RAW-ROI CNN MANGO RECHECK
+    if (
+        rule_species not in {"Mango", "Strawberry"}
+        and yolo_species in {"Orange", "Banana"}
+        and raw_cnn_type == "Mango"
+        and raw_cnn_conf >= 0.95
+        and type_label == "Mango"
+        and type_conf >= 0.80
+        and aspect >= 1.15
+        and circularity is not None
+        and circularity < 0.90
+    ):
+        rule_species = "Mango"
+        rule_confidence = float(max(raw_cnn_conf, type_conf))
+        rule_reason = "raw_roi_mango_recheck"
+
+    # BANANA -> MANGO DISAGREEMENT FALLBACK
+    if (
+        yolo_species == "Banana"
+        and yolo_confidence <= 0.85
+        and type_label == "Orange"
+        and type_conf <= 0.85
+        and 0.10 <= red_ratio <= 0.35
+        and aspect <= 1.25
+        and circularity is not None
+        and 0.70 <= circularity < 0.85
+    ):
+        rule_species = "Mango"
+        rule_confidence = float(max(yolo_confidence, type_conf))
+        rule_reason = "banana_mango_disagreement_fallback"
+
+    # LOW-RED WEAK-ORANGE -> MANGO FALLBACK
+    #
+    # IMPORTANT:
+    # A healthy GREEN/UNRIPE ORANGE also has very low red_ratio. The old
+    # version changed an Orange to Mango even when BOTH CNN views themselves
+    # said Orange. That is too aggressive.
+    #
+    # Mango fallback now requires actual Mango evidence from the RAW-ROI CNN.
+    # If YOLO + processed CNN + raw CNN agree on Orange, Orange is preserved.
+    if (
+        yolo_species == "Orange"
+        and type_label == "Orange"
+        and not native_orange_consensus
+        and yolo_confidence < 0.90
+        and type_conf < 0.85
+        and raw_cnn_type == "Mango"
+        and raw_cnn_conf >= 0.75
+        and red_ratio <= 0.08
+        and circularity is not None
+        and circularity < 0.77
+    ):
+        rule_species = "Mango"
+        rule_confidence = float(max(yolo_confidence, type_conf, raw_cnn_conf))
+        rule_reason = "low_red_weak_orange_mango_fallback_with_mango_evidence"
+
+    # ORANGE -> MANGO SHAPE FALLBACK
+    #
+    # Shape alone is not allowed to turn an Orange into Mango anymore.
+    # Leaves/occlusion can make a true orange crop look elongated and reduce
+    # circularity. Require supporting Mango evidence from the raw-ROI CNN.
+    if (
+        basic_override is None
+        and yolo_species == "Orange"
+        and type_label == "Orange"
+        and not native_orange_consensus
+        and raw_cnn_type == "Mango"
+        and raw_cnn_conf >= 0.75
+        and circularity is not None
+        and (
+            (
+                type_conf <= 0.93
+                and red_ratio <= 0.15
+                and aspect >= 1.23
+                and circularity < 0.79
+            )
+            or (aspect >= 1.24 and circularity < 0.76)
+        )
+    ):
+        rule_species = "Mango"
+        rule_confidence = float(max(type_conf, raw_cnn_conf))
+        rule_reason = "orange_mango_shape_fallback_with_mango_evidence"
+
+    # LARGE/WEAK YOLO ORANGE -> STRAWBERRY USING VERIFIED SEGMENTED FRAGMENTS
+    strawberry_evidence = _contained_strawberry_evidence(
+        bbox_xyxy, verified_strawberry_blobs
+    )
+    if yolo_species == "Orange" and strawberry_evidence:
+        x1, y1, x2, y2 = bbox_xyxy
+        current_area = max(1, (x2 - x1) * (y2 - y1))
+        strong_fragment_count = len(strawberry_evidence)
+        large_fragment = any(
+            max(1, (e["bbox"][2] - e["bbox"][0]) * (e["bbox"][3] - e["bbox"][1]))
+            >= current_area * 0.28
+            for e in strawberry_evidence
+        )
+        if (
+            (yolo_confidence < 0.55 and strong_fragment_count >= 1)
+            or strong_fragment_count >= 2
+            or large_fragment
+        ):
+            rule_species = "Strawberry"
+            rule_confidence = float(max(e["confidence"] for e in strawberry_evidence))
+            rule_reason = "contained_strawberry_fragment_evidence"
+
+    _dbg(
+        "_build_cnn_rule_candidate: "
+        f"yolo={yolo_species}({yolo_confidence:.3f}) "
+        f"cnn={type_label}({type_conf:.3f}) "
+        f"raw_cnn={raw_cnn_type}({raw_cnn_conf:.3f}) "
+        f"aspect={aspect:.3f} "
+        f"circularity={'n/a' if circularity is None else f'{circularity:.3f}'} "
+        f"red={red_ratio:.3f} -> rule={rule_species}({rule_confidence:.3f}) "
+        f"reason={rule_reason}"
+    )
+
+    return {
+        "species": rule_species,
+        "confidence": rule_confidence,
+        "reason": rule_reason,
+        "cnn_species": type_label,
+        "cnn_confidence": float(type_conf),
+        "cnn_probs": type_probs,
+        "raw_cnn_species": raw_cnn_type,
+        "raw_cnn_confidence": float(raw_cnn_conf),
+        "raw_cnn_probs": raw_probs,
+        "aspect": aspect,
+        "circularity": circularity,
+        "red_ratio": red_ratio,
+    }
+
+
+def _prescan_verified_strawberry_blobs(original_bgr, segmented_blobs):
+    """Pre-scan segmented objects for strong Strawberry evidence.
+
+    This is the same idea as test_defect.py's pre-scan. It is used only to
+    strengthen the CNN/rule candidate when a mouldy Strawberry is swallowed by
+    one large YOLO Orange box.
+    """
+    verified = []
+    if not segmented_blobs:
+        return verified
+
+    h_img, w_img = original_bgr.shape[:2]
+    for blob in segmented_blobs:
+        bx, by, bw, bh = blob.get("bbox", (0, 0, 0, 0))
+        x1, y1 = max(0, int(bx)), max(0, int(by))
+        x2, y2 = min(w_img, int(bx + bw)), min(h_img, int(by + bh))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        raw_roi = original_bgr[y1:y2, x1:x2].copy()
+        if raw_roi.size == 0:
+            continue
+
+        local_mask = None
+        cnn_roi = raw_roi
+        full_mask = blob.get("mask")
+        if isinstance(full_mask, np.ndarray):
+            candidate_mask = full_mask[y1:y2, x1:x2]
+            if candidate_mask.shape[:2] == raw_roi.shape[:2]:
+                local_mask = candidate_mask
+                cnn_roi = cv2.bitwise_and(raw_roi, raw_roi, mask=local_mask)
+
+        try:
+            cnn_type, cnn_conf, _ = _predict_type_candidate(cnn_roi)
+        except Exception as exc:
+            _dbg(f"_prescan_verified_strawberry_blobs: CNN error: {exc}")
+            continue
+
+        aspect, circularity = get_shape_values(
+            blob.get("contour"), raw_roi.shape[1], raw_roi.shape[0]
+        )
+        red_ratio = calculate_red_ratio(raw_roi, local_mask)
+        override = choose_cnn_override(
+            0.0, cnn_type, cnn_conf, aspect, circularity, red_ratio
+        )
+        if override == "strawberry":
+            verified.append(
+                {
+                    "bbox": (x1, y1, x2, y2),
+                    "confidence": float(cnn_conf),
+                    "red_ratio": float(red_ratio),
+                    "aspect": float(aspect),
+                    "circularity": circularity,
+                }
+            )
+    return verified
+
+
+def _classify_species(
+    crop_bgr,
+    yolo_label,
+    yolo_conf,
+    local_contour,
+    raw_crop_bgr=None,
+    raw_mask=None,
+    bbox_xyxy=None,
+    verified_strawberry_blobs=None,
+    morph_species=None,
+    morph_confidence=0.0,
+):
+    """Choose fruit species by an independent majority vote.
+
+    Vote 1: raw fruit_yolo_v4 result (Apple/Banana/Orange only)
+    Vote 2: full five-class CNN/rule candidate, including BOTH CNN views and
+            every Strawberry/Mango correction/fallback from test_defect.py
+    Vote 3: teammate Morph V12 candidate
+
+    The old implementation counted YOLO twice (raw YOLO + an 'own' candidate
+    that started from YOLO). This version removes that double-counting.
+    """
+    if raw_crop_bgr is None:
+        raw_crop_bgr = crop_bgr
+
+    yolo_species = yolo_label.capitalize() if yolo_label else None
+    yolo_confidence = float(yolo_conf or 0.0)
+    if yolo_species not in YOLO_NATIVE_SPECIES:
+        yolo_species = None
+        yolo_confidence = 0.0
+
+    rule = _build_cnn_rule_candidate(
+        crop_bgr=crop_bgr,
+        raw_crop_bgr=raw_crop_bgr,
+        yolo_species=yolo_species,
+        yolo_confidence=yolo_confidence,
+        local_contour=local_contour,
+        raw_mask=raw_mask,
+        bbox_xyxy=bbox_xyxy,
+        verified_strawberry_blobs=verified_strawberry_blobs,
+    )
+    rule_species = rule["species"]
+    rule_confidence = float(rule["confidence"])
+
     if morph_species is not None:
-        candidates.append(("morph", morph_species, morph_confidence))
+        morph_species = str(morph_species).capitalize()
+        if morph_species not in VALID_SPECIES:
+            morph_species = None
+            morph_confidence = 0.0
 
-    # Majority vote across the (up to 3) candidates, not just "take the
-    # highest confidence" -- per explicit instruction. Whichever species
-    # label at least 2 of them agree on wins; its confidence is the
-    # highest confidence among the agreeing candidates. If all candidates
-    # disagree (a 3-way split, or a 1-vs-1 tie when morph has no match),
-    # there is no majority, so the highest single confidence is the only
-    # signal left to break the tie.
-    vote_counts = Counter(sp for _, sp, _ in candidates)
-    top_species, top_votes = vote_counts.most_common(1)[0]
+    candidates = []
+    if yolo_species is not None:
+        candidates.append(("yolo", yolo_species, yolo_confidence))
+    if rule_species is not None:
+        candidates.append(("cnn_rules", rule_species, rule_confidence))
+    if morph_species is not None:
+        candidates.append(("morph", morph_species, float(morph_confidence)))
 
-    if top_votes >= 2:
-        agreeing = [(s, sp, c) for s, sp, c in candidates if sp == top_species]
-        species = top_species
-        confidence = max(c for _, _, c in agreeing)
-        source = "majority(" + "+".join(s for s, _, _ in agreeing) + ")"
+    if not candidates:
+        species, confidence, source = None, 0.0, "no_species_candidate"
     else:
-        source, species, confidence = max(candidates, key=lambda c: c[2])
-        source = f"no_majority_highest_conf:{source}"
+        # ----------------------------------------------------------
+        # HIGH-CONFIDENCE NATIVE YOLO PROTECTION
+        # ----------------------------------------------------------
+        #
+        # Example that motivated this guard:
+        #   YOLO      -> Orange 0.98
+        #   CNN rules -> Mango  0.99
+        #   Morph     -> Mango  0.93
+        #
+        # A green/unripe Orange can look Mango-like to both CNN and
+        # morphology. Because the project YOLO was specifically trained on
+        # Apple/Banana/Orange, a >=95% native YOLO result is treated as strong
+        # class-specific evidence. A non-native majority may still overturn
+        # it, but only when BOTH alternative voters agree AND EACH is >=95%.
+        native_lock_applied = False
 
-    _dbg(f"_classify_species: candidates=[{', '.join(f'{s}={sp}({c:.3f})' for s, sp, c in candidates)}] "
-         f"-> winner={source} final={species}({confidence:.3f})")
+        if (
+            yolo_species in YOLO_NATIVE_SPECIES
+            and yolo_confidence >= NATIVE_YOLO_LOCK_CONF
+        ):
+            opposing = [
+                (name, sp, conf)
+                for name, sp, conf in candidates
+                if name != "yolo" and sp != yolo_species
+            ]
+
+            # Only a same-species pair of extremely strong alternative votes
+            # is allowed to beat the locked native YOLO result.
+            strong_opposing_override = (
+                len(opposing) >= 2
+                and opposing[0][1] == opposing[1][1]
+                and all(
+                    conf >= NON_NATIVE_OVERRIDE_MIN_CONF
+                    for _, _, conf in opposing[:2]
+                )
+            )
+
+            if not strong_opposing_override:
+                species = yolo_species
+                confidence = yolo_confidence
+                source = "high_conf_native_yolo_lock"
+                native_lock_applied = True
+
+        if not native_lock_applied:
+            vote_counts = Counter(sp for _, sp, _ in candidates)
+            top_species, top_votes = vote_counts.most_common(1)[0]
+
+            if top_votes >= 2:
+                agreeing = [
+                    (s, sp, c)
+                    for s, sp, c in candidates
+                    if sp == top_species
+                ]
+                species = top_species
+                confidence = max(c for _, _, c in agreeing)
+                source = "majority(" + "+".join(
+                    s for s, _, _ in agreeing
+                ) + ")"
+            else:
+                source_name, species, confidence = max(
+                    candidates,
+                    key=lambda c: c[2]
+                )
+                source = f"no_majority_highest_conf:{source_name}"
+
+    _dbg(
+        f"_classify_species: candidates=[{', '.join(f'{s}={sp}({c:.3f})' for s, sp, c in candidates)}] "
+        f"-> winner={source} final={species}({confidence:.3f})"
+    )
 
     return {
         "species": species,
-        "species_confidence": confidence,
+        "species_confidence": float(confidence),
         "species_source": source,
         "yolo_species": yolo_species,
         "yolo_confidence": yolo_confidence,
-        "cnn_species": type_label,
-        "cnn_confidence": type_conf,
-        "own_species": own_species,
-        "own_confidence": own_confidence,
+        "cnn_species": rule["cnn_species"],
+        "cnn_confidence": rule["cnn_confidence"],
+        "raw_cnn_species": rule["raw_cnn_species"],
+        "raw_cnn_confidence": rule["raw_cnn_confidence"],
+        "cnn_rule_species": rule_species,
+        "cnn_rule_confidence": rule_confidence,
+        "cnn_rule_reason": rule["reason"],
+        # legacy fields now mirror the independent CNN/rule vote
+        "own_species": rule_species,
+        "own_confidence": rule_confidence,
         "morph_species": morph_species,
-        "morph_confidence": morph_confidence,
+        "morph_confidence": float(morph_confidence),
     }
-
 
 def _defect_ripeness_confidence(ripeness, colour1, colour2, defect_pct):
     """
@@ -568,6 +961,7 @@ def _fuse_quality(species, colour_label, colour_conf, colour_probs, defect_label
 
 
 def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roughness=None, raw_crop_bgr=None,
+                   type_raw_crop_bgr=None, type_mask=None, bbox_xyxy=None, verified_strawberry_blobs=None,
                    morph_species=None, morph_confidence=0.0, morph_obj=None, morph_iou=0.0, morph_status=None):
     """Run every available module on one already-cropped fruit and return a
     combined FruitResult.
@@ -593,10 +987,19 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
     """
     if raw_crop_bgr is None:
         raw_crop_bgr = crop_bgr
+    if type_raw_crop_bgr is None:
+        type_raw_crop_bgr = raw_crop_bgr
     result = FruitResult(bbox=(0, 0, crop_bgr.shape[1], crop_bgr.shape[0]), crop=crop_bgr)
 
-    species_out = _classify_species(crop_bgr, yolo_label, yolo_conf, contour,
-                                     morph_species=morph_species, morph_confidence=morph_confidence)
+    species_out = _classify_species(
+        crop_bgr, yolo_label, yolo_conf, contour,
+        raw_crop_bgr=type_raw_crop_bgr,
+        raw_mask=type_mask,
+        bbox_xyxy=bbox_xyxy,
+        verified_strawberry_blobs=verified_strawberry_blobs,
+        morph_species=morph_species,
+        morph_confidence=morph_confidence,
+    )
     species = species_out["species"]
     result.species = species
     result.species_confidence = species_out["species_confidence"]
@@ -605,6 +1008,11 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
     result.yolo_confidence = species_out["yolo_confidence"]
     result.cnn_species = species_out["cnn_species"]
     result.cnn_confidence = species_out["cnn_confidence"]
+    result.raw_cnn_species = species_out["raw_cnn_species"]
+    result.raw_cnn_confidence = species_out["raw_cnn_confidence"]
+    result.cnn_rule_species = species_out["cnn_rule_species"]
+    result.cnn_rule_confidence = species_out["cnn_rule_confidence"]
+    result.cnn_rule_reason = species_out["cnn_rule_reason"]
     result.own_species = species_out["own_species"]
     result.own_confidence = species_out["own_confidence"]
     result.morph_fruit_type = species_out["morph_species"]
@@ -639,7 +1047,7 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
 
     if species in DEFECT_SUPPORTED_SPECIES:
         try:
-            defect_out = defect_detection.detect_defect(raw_crop_bgr, species)
+            defect_out = detect_defect(raw_crop_bgr, species)
             # defect_detection.py's helpers mostly return (annotated, mask, percentage);
             # be defensive since this module was built independently and not touched here.
             if isinstance(defect_out, tuple) and len(defect_out) >= 1:
@@ -667,7 +1075,7 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
     defect_label, defect_conf = None, 0.0
     if species in RIPENESS_RULE_SPECIES:
         try:
-            ripeness_out = ripeness_detection.classify_ripeness(
+            ripeness_out = classify_ripeness(
                 raw_crop_bgr, species, result.defect_percentage or 0.0
             )
             raw_ripeness = ripeness_out.get("ripeness")
@@ -804,11 +1212,11 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
     """Detect every fruit in the photo (fruit_yolo_v4 + classical-segmentation
     fallback) and analyse each one.
 
-    Returns (results, resized_image) -- resized_image is what every bbox is
-    relative to (see DEFAULT_IMAGE_SIZE), so callers must display/draw on
-    THIS image, not the original upload, or boxes will be misaligned.
+    Returns (results, display_image). The pipeline keeps the uploaded image's
+    original resolution so YOLO receives exactly the same pixels/aspect ratio
+    as the standalone defect test.
     """
-    original_bgr = cv2.resize(original_bgr, DEFAULT_IMAGE_SIZE)
+    original_bgr = original_bgr.copy()
 
     # Run the teammate's independent morphological/texture module ONCE per
     # photo (it does its own whole-image YOLO pass), so its per-object
@@ -842,6 +1250,22 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
             return None, 0.0
         return best_obj, best_iou
 
+    # Segment once and reuse for both Strawberry evidence pre-scan and the
+    # Mango/Strawberry fallback pass later.
+    try:
+        segmented_blobs = segment_all_objects(original_bgr)
+    except Exception as e:
+        _dbg(f"run_overall_pipeline: segment_all_objects error: {e}")
+        segmented_blobs = []
+
+    verified_strawberry_blobs = _prescan_verified_strawberry_blobs(
+        original_bgr, segmented_blobs
+    )
+    _dbg(
+        f"run_overall_pipeline: verified Strawberry evidence blobs="
+        f"{len(verified_strawberry_blobs)}"
+    )
+
     yolo_model = _load_yolo()
     # agnostic_nms + low conf on purpose: fruit_yolo_v4 only knows Apple/
     # Banana/Orange, so a real Mango/Strawberry can only surface as a WEAK
@@ -865,27 +1289,31 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
             yolo_conf = float(box.conf[0])
             x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
             h_img, w_img = original_bgr.shape[:2]
-            pad = 0.08
-            bw, bh = x2 - x1, y2 - y1
-            x0 = max(0, int(x1 - pad * bw)); y0 = max(0, int(y1 - pad * bh))
-            x1p = min(w_img, int(x2 + pad * bw)); y1p = min(h_img, int(y2 + pad * bh))
-            if x1p <= x0 or y1p <= y0:
-                continue
+            x1 = max(0, min(x1, w_img - 1))
+            y1 = max(0, min(y1, h_img - 1))
+            x2 = max(x1 + 1, min(x2, w_img))
+            y2 = max(y1 + 1, min(y2, h_img))
 
-            # Duplicate/fragment removal: drop a box whose centre falls inside
-            # an already-accepted box AND whose area is a small fraction of
-            # it -- a smaller echo of the same fruit, not a second fruit.
-            box_area = (x1p - x0) * (y1p - y0)
-            cx, cy = (x0 + x1p) // 2, (y0 + y1p) // 2
+            # Match test_defect.py exactly: duplicate/tiny-box checks use the
+            # ORIGINAL YOLO rectangle, not an expanded/padded rectangle.
+            box_area = (x2 - x1) * (y2 - y1)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             is_fragment = any(
-                ox0 <= cx <= ox1 and oy0 <= cy <= oy1 and box_area < oarea * DUPLICATE_FRAGMENT_MAX_AREA_RATIO
-                for ox0, oy0, ox1, oy1, oarea in accepted_boxes
+                ox1 <= cx <= ox2 and oy1 <= cy <= oy2
+                and box_area < oarea * DUPLICATE_FRAGMENT_MAX_AREA_RATIO
+                for ox1, oy1, ox2, oy2, oarea in accepted_boxes
             )
             if is_fragment:
+                _dbg(f"REJECT duplicate fragment: {yolo_label}({yolo_conf:.3f}) box={(x1,y1,x2,y2)}")
                 continue
             if box_area / image_area < MIN_BOX_AREA_RATIO:
+                _dbg(f"REJECT tiny box: {yolo_label}({yolo_conf:.3f}) box={(x1,y1,x2,y2)}")
                 continue
-            accepted_boxes.append((x0, y0, x1p, y1p, box_area))
+            accepted_boxes.append((x1, y1, x2, y2, box_area))
+
+            # Use the raw YOLO box for the integrated path too. This keeps
+            # localisation identical to the standalone defect test.
+            x0, y0, x1p, y1p = x1, y1, x2, y2
 
             crop_for_seg = prep.preprocess_image(original_bgr[y0:y1p, x0:x1p], denoise_method="median", enhance_method="none")
             local_mask, local_contour = segmentation_mask_and_contour(crop_for_seg)
@@ -907,37 +1335,45 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
             if crop.size == 0:
                 crop = raw_crop
 
-            # Defect/ripeness get a neutral-filled crop (real colours inside
-            # this fruit's own contour, neutral grey outside) instead of the
-            # literal box rectangle, UNLESS the contour is just the synthetic
-            # full-box fallback rectangle -- in that case there is no real
-            # boundary to isolate against, so the plain box is all we have.
-            if used_fallback_rect:
-                defect_raw_crop = raw_crop
-            else:
-                defect_raw_crop = _neutral_isolate_and_crop(original_bgr, local_contour, x0, y0)
-                if defect_raw_crop.size == 0:
-                    defect_raw_crop = raw_crop
+            # IMPORTANT: keep the true rectangular YOLO ROI for
+            # defect detection, ripeness and stem analysis.
+            #
+            # The isolated/neutral-grey crop is useful for CNN species
+            # classification, but it must NOT be used for the defect display.
+            # The standalone defect test also calls detect_defect(raw_roi, ...),
+            # so using raw_crop here keeps the annotated result looking like the
+            # original fruit crop with only the red defect outline added.
+            defect_raw_crop = raw_crop
 
             morph_obj, morph_iou = _match_morph((x0, y0, x1p - x0, y1p - y0))
-            if morph_obj is None:
-                # Constraint: the morphological/texture module must confirm
-                # this box (IoU-matched against its own independent YOLO
-                # detection) -- if it found no match here, drop the box
-                # entirely instead of showing it as "not matched".
-                _dbg(f"run_overall_pipeline: main-loop box ({x0},{y0})-({x1p},{y1p}) yolo_label={yolo_label}"
-                     f"({yolo_conf:.3f}) DROPPED -- no morphological/texture match ({morph_status or 'no match'})")
-                continue
-            # V12 can spatially confirm a box (IoU match) yet still be
-            # unsure WHAT it is (fruit_type=None, its own "Unknown" class)
-            # -- that still satisfies the "morph must confirm this box
-            # exists" gate above, it just contributes no species vote.
-            morph_species = morph_obj["fruit_type"].capitalize() if morph_obj.get("fruit_type") else None
-            morph_confidence = float(morph_obj["fruit_type_confidence"]) if morph_obj.get("fruit_type") else 0.0
+            if morph_obj is not None:
+                morph_species = morph_obj["fruit_type"].capitalize() if morph_obj.get("fruit_type") else None
+                morph_confidence = float(morph_obj["fruit_type_confidence"]) if morph_obj.get("fruit_type") else 0.0
+            else:
+                # Morph V12 is optional third-vote evidence. It must never
+                # delete a valid YOLO fruit when it has no spatial match.
+                morph_species = None
+                morph_confidence = 0.0
+                _dbg(
+                    f"NO MORPH MATCH: keeping {yolo_label}({yolo_conf:.3f}) "
+                    f"box=({x0},{y0},{x1p},{y1p}) and continuing with YOLO+CNN/rules"
+                )
 
-            result = analyse_fruit(crop, yolo_label, yolo_conf, mask=local_mask, contour=shape_contour, raw_crop_bgr=defect_raw_crop,
-                                    morph_species=morph_species, morph_confidence=morph_confidence,
-                                    morph_obj=morph_obj, morph_iou=morph_iou, morph_status=morph_status)
+            result = analyse_fruit(
+                crop, yolo_label, yolo_conf,
+                mask=local_mask,
+                contour=shape_contour,
+                raw_crop_bgr=defect_raw_crop,
+                type_raw_crop_bgr=raw_crop,
+                type_mask=local_mask,
+                bbox_xyxy=(x0, y0, x1p, y1p),
+                verified_strawberry_blobs=verified_strawberry_blobs,
+                morph_species=morph_species,
+                morph_confidence=morph_confidence,
+                morph_obj=morph_obj,
+                morph_iou=morph_iou,
+                morph_status=morph_status,
+            )
 
             # Confidence floors applied AFTER species override, and only if
             # the CNN did NOT move it away from Apple/Banana -- a real Mango/
@@ -977,20 +1413,35 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
     # Fallback pass: classical segmentation for fruit YOLO's base weights can't
     # name at all (Mango, Strawberry), mirroring the original system's approach.
     denoised_full = prep.denoise(original_bgr, method="median")
-    for blob in segment_all_objects(original_bgr):
+    for blob in segmented_blobs:
         bx, by, bw, bh = blob["bbox"]
-        cx, cy = bx + bw // 2, by + bh // 2
-        if 0 <= cy < claimed_mask.shape[0] and 0 <= cx < claimed_mask.shape[1] and claimed_mask[cy, cx] > 0:
-            # NOTE: this only checks whether this blob's CENTRE POINT falls
-            # inside a main-loop box's full RECTANGLE (not that box's real
-            # fruit silhouette) -- if one YOLO box happens to span across two
-            # real, touching fruits (common when they're the same colour),
-            # its rectangle can swallow a second fruit's centre here and
-            # silently drop it, even though it was correctly segmented.
-            _dbg(f"run_overall_pipeline: fallback blob bbox=({bx},{by},{bw},{bh}) centre=({cx},{cy}) "
-                 f"SKIPPED -- centre falls inside an already-claimed main-loop box rectangle")
+        blob_x1, blob_y1 = int(bx), int(by)
+        blob_x2, blob_y2 = int(bx + bw), int(by + bh)
+        blob_area = max(1, int(bw) * int(bh))
+
+        # Match test_defect.py's confirmed-box idea: skip only when MOST of
+        # this segmented blob is already covered by a fruit that actually
+        # survived the main YOLO path. Do not use a single centre-point test.
+        already_detected = False
+        for confirmed in results:
+            cx, cy, cw, ch = confirmed.bbox
+            conf_x2, conf_y2 = cx + cw, cy + ch
+            ix1, iy1 = max(blob_x1, cx), max(blob_y1, cy)
+            ix2, iy2 = min(blob_x2, conf_x2), min(blob_y2, conf_y2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            overlap_ratio = inter / blob_area
+            threshold = 0.75 if confirmed.species == "Strawberry" else 0.45
+            if overlap_ratio >= threshold:
+                already_detected = True
+                break
+
+        if already_detected:
+            _dbg(
+                f"fallback blob bbox=({bx},{by},{bw},{bh}) SKIPPED -- "
+                f"mostly covered by a confirmed fruit"
+            )
             continue
-        _dbg(f"run_overall_pipeline: fallback blob bbox=({bx},{by},{bw},{bh}) centre=({cx},{cy}) accepted, analysing...")
+        _dbg(f"fallback blob bbox=({bx},{by},{bw},{bh}) accepted, analysing...")
         # blob["contour"]/["mask"] are already in full-image coordinates.
         # NOTE: unlike the main loop, colorDetection.py's fallback pass does
         # NOT apply the extra 10px mask erosion (that only happens when a
@@ -1006,24 +1457,79 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
             crop = raw_crop
         if crop.size == 0:
             continue
-        defect_raw_crop = _neutral_isolate_and_crop(original_bgr, blob["contour"], 0, 0)
-        if defect_raw_crop.size == 0:
-            defect_raw_crop = raw_crop
+        # Keep the original rectangular segmented-object ROI for
+        # defect/ripeness/stem, matching the standalone defect pipeline.
+        defect_raw_crop = raw_crop
+        blob_full_mask = blob.get("mask")
+        blob_local_mask = None
+        if isinstance(blob_full_mask, np.ndarray):
+            candidate_local_mask = blob_full_mask[by:by + bh, bx:bx + bw]
+            if candidate_local_mask.shape[:2] == raw_crop.shape[:2]:
+                blob_local_mask = candidate_local_mask
         blob_roughness = compute_texture_roughness(denoised_full, blob["mask"])
         morph_obj, morph_iou = _match_morph((bx, by, bw, bh))
-        if morph_obj is None:
-            # Same constraint as the main loop: no morphological/texture
-            # match means this box is dropped, not shown as "not matched".
-            _dbg(f"run_overall_pipeline: fallback blob bbox=({bx},{by},{bw},{bh}) "
-                 f"DROPPED -- no morphological/texture match ({morph_status or 'no match'})")
-            continue
-        morph_species = morph_obj["fruit_type"].capitalize() if morph_obj.get("fruit_type") else None
-        morph_confidence = float(morph_obj["fruit_type_confidence"]) if morph_obj.get("fruit_type") else 0.0
-        result = analyse_fruit(crop, "unknown", 0.0, mask=blob["mask"], contour=blob["contour"], roughness=blob_roughness, raw_crop_bgr=defect_raw_crop,
-                                morph_species=morph_species, morph_confidence=morph_confidence,
-                                morph_obj=morph_obj, morph_iou=morph_iou, morph_status=morph_status)
+        if morph_obj is not None:
+            morph_species = morph_obj["fruit_type"].capitalize() if morph_obj.get("fruit_type") else None
+            morph_confidence = float(morph_obj["fruit_type_confidence"]) if morph_obj.get("fruit_type") else 0.0
+        else:
+            morph_species = None
+            morph_confidence = 0.0
+            _dbg(f"NO MORPH MATCH on fallback blob ({bx},{by},{bw},{bh}) -- keeping candidate")
+        result = analyse_fruit(
+            crop, "unknown", 0.0,
+            mask=blob["mask"],
+            contour=blob["contour"],
+            roughness=blob_roughness,
+            raw_crop_bgr=defect_raw_crop,
+            type_raw_crop_bgr=raw_crop,
+            type_mask=blob_local_mask,
+            bbox_xyxy=(bx, by, bx + bw, by + bh),
+            verified_strawberry_blobs=verified_strawberry_blobs,
+            morph_species=morph_species,
+            morph_confidence=morph_confidence,
+            morph_obj=morph_obj,
+            morph_iou=morph_iou,
+            morph_status=morph_status,
+        )
         if result.species not in FALLBACK_ONLY_SPECIES:
             continue
+
+        # Apple/Banana/Orange used to be discarded here because the fallback
+        # was restricted to Mango/Strawberry only. That means a damaged Orange
+        # missed by whole-image YOLO could be correctly segmented/classified,
+        # then silently thrown away. Allow native species to recover too, but
+        # require stronger independent evidence so background blobs do not turn
+        # into false fruit detections.
+        if result.species in YOLO_NATIVE_SPECIES:
+            cnn_native_ok = (
+                result.cnn_rule_species == result.species
+                and result.cnn_rule_confidence >= FALLBACK_NATIVE_MIN_CNN_CONF
+            )
+            morph_native_ok = (
+                result.morph_fruit_type == result.species
+                and result.morph_fruit_type_confidence >= FALLBACK_NATIVE_MIN_MORPH_CONF
+            )
+            cnn_morph_agree = (
+                result.cnn_rule_species == result.species
+                and result.morph_fruit_type == result.species
+                and result.cnn_rule_confidence >= 0.65
+                and result.morph_fruit_type_confidence >= 0.50
+            )
+
+            if not (cnn_native_ok or morph_native_ok or cnn_morph_agree):
+                _dbg(
+                    f"REJECT fallback {result.species}: "
+                    f"CNN={result.cnn_rule_species}({result.cnn_rule_confidence:.3f}) "
+                    f"Morph={result.morph_fruit_type}({result.morph_fruit_type_confidence:.3f})"
+                )
+                continue
+
+        _dbg(
+            f"ACCEPT fallback fruit: species={result.species} "
+            f"CNN={result.cnn_rule_species}({result.cnn_rule_confidence:.3f}) "
+            f"Morph={result.morph_fruit_type}({result.morph_fruit_type_confidence:.3f}) "
+            f"bbox=({bx},{by},{bw},{bh})"
+        )
         result.bbox = (bx, by, bw, bh)
         results.append(result)
 

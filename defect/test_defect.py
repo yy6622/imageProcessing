@@ -5,8 +5,8 @@ import cv2 as cv
 import numpy as np
 from ultralytics import YOLO
 
-from defect_detection import detect_defect
-from ripeness_detection import classify_ripeness
+from .defect_detection import detect_defect
+from .ripeness_detection import classify_ripeness
 
 
 # =================================================
@@ -21,22 +21,20 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # Friend functions are only USED, not modified
-from colorDetection import classify_fruit_type_cnn
-from segmentation import (
+from fruit_type import train_fruit_type as classify_fruit_type_cnn
+from common.segmentation import (
     contour_shape_metrics,
     segment_all_objects,
 )
 
 
-IMAGE_PATH = CURRENT_DIR / "rotten_mango.png"
+IMAGE_PATH = CURRENT_DIR / "two_apple.png"
 
 MODEL_PATH = (
     PROJECT_ROOT
-    / "runs"
-    / "detect"
-    / "fruit_yolo_v4"
+    / "defect"
     / "weights"
-    / "best.pt"
+    / "fruit_yolo_v4_best.pt"
 )
 
 

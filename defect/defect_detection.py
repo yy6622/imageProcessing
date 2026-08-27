@@ -4011,6 +4011,18 @@ def detect_orange_defect(roi):
             green_inner_mask
         )
 
+        # A healthy green orange (and any leaf entering the YOLO crop)
+        # can contain very dark, highly saturated green pixels. Those
+        # must not be treated as generic black/dark fruit damage.
+        # Genuine dark-green mould is handled separately below by the
+        # stricter green_safe_mold_mask path.
+        strong_green_dark = cv.bitwise_and(
+            strong_green_dark,
+            cv.bitwise_not(
+                healthy_green
+            )
+        )
+
         # High-confidence mould, with glare removed again
         green_mould_damage = cv.bitwise_and(
             green_safe_mold_mask,
@@ -4058,6 +4070,37 @@ def detect_orange_defect(roi):
             iterations=1
         )
 
+        # Extra geometry guard for green/unripe oranges.
+        # The fruit is normally the large central rounded object in the
+        # YOLO crop; leaves are commonly attached at the top/side. Restrict
+        # green-orange defect candidates to a conservative central ellipse
+        # so leaf shadows/leaf tissue cannot become red defect regions.
+        green_central_guard = np.zeros_like(
+            green_final_defect
+        )
+
+        cv.ellipse(
+            green_central_guard,
+            (
+                green_w // 2,
+                green_h // 2
+            ),
+            (
+                max(5, int(green_w * 0.43)),
+                max(5, int(green_h * 0.43))
+            ),
+            0,
+            0,
+            360,
+            255,
+            cv.FILLED
+        )
+
+        green_final_defect = cv.bitwise_and(
+            green_final_defect,
+            green_central_guard
+        )
+
         green_component_mask = np.zeros_like(
             green_final_defect
         )
@@ -4076,10 +4119,10 @@ def detect_orange_defect(roi):
         )
 
         green_component_min_area = max(
-            60,
+            80,
             int(
                 green_fruit_pixels_final
-                * 0.0015
+                * 0.004
             )
         )
 
@@ -4110,7 +4153,7 @@ def detect_orange_defect(roi):
                 gh / max(1, gw)
             )
 
-            if green_extent < 0.20:
+            if green_extent < 0.28:
                 continue
 
             if green_aspect > 5.0:
