@@ -1,0 +1,25 @@
+# Core
+streamlit
+numpy
+pandas
+opencv-python
+
+# colour/ (colour KNN -- ripeness/quality classification)
+scipy
+scikit-learn
+joblib
+
+# morphological/ (shape + GLCM texture features)
+scikit-image
+
+# fruit_type/ (CNN species classifier)
+torch
+torchvision
+
+# defect/, stem/ (YOLO detection)
+ultralytics
+
+# Reporting / charts
+matplotlib
+Pillow
+reportlab==4.0.9  # newer versions need a hashlib/OpenSSL feature not available on older Python builds
