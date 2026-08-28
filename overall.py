@@ -110,6 +110,44 @@ MANGO_MIN_CONF = 0.75  # lowered from 0.85 -- a real unripe/green mango scored 0
 MANGO_MIN_ASPECT = 1.18
 MANGO_MAX_CIRCULARITY = 0.90
 
+# Mango rescue thresholds.
+# The current YOLO weights were trained only on Apple/Banana/Orange, so a
+# Mango can receive a very confident Banana/Apple YOLO label. These thresholds
+# allow the five-class CNN to correct ONLY that specific non-native case,
+# without weakening the Orange protection below.
+MANGO_RAW_RESCUE_MIN_CONF = 0.97
+MANGO_RAW_RESCUE_MIN_ASPECT = 1.12
+MANGO_RAW_RESCUE_MAX_CIRCULARITY = 0.92
+MANGO_TWO_VIEW_MIN_CONF = 0.80
+MANGO_MORPH_SUPPORT_MIN_CONF = 0.70
+
+# One-vote Mango rescue for the exact case where YOLO (which cannot output
+# Mango) says Apple/Banana and the five-class CNN+rules says Mango, while the
+# morphology module has no usable vote. The CNN+rules Mango candidate has
+# already passed Mango confidence + shape/circularity safety gates, so allow it
+# to win only when the two confidences are close. This prevents a 90% Banana
+# guess from beating an 84% Mango solely because there are only two voters.
+MANGO_SINGLE_RULE_MIN_CONF = 0.82
+MANGO_SINGLE_RULE_MAX_YOLO_CONF = 0.92
+MANGO_SINGLE_RULE_MAX_YOLO_GAP = 0.10
+
+# Ripe Mango appearance rescue:
+# Some red/yellow ripe mangoes are confidently called Apple by both the
+# Apple/Banana/Orange-only YOLO and even the five-class CNN. A very specific
+# shape + vertical colour-gradient pattern can rescue those without weakening
+# Orange protection or ordinary round apples.
+RIPE_MANGO_MIN_ASPECT = 1.28
+RIPE_MANGO_MAX_CIRCULARITY = 0.88
+RIPE_MANGO_MIN_PATTERN_SCORE = 0.88
+
+# Extra rescue for the specific failure mode where BOTH YOLO and the CNN/rules
+# confidently call a ripe red/yellow Mango Apple/Banana, while Morph V12
+# independently identifies Mango. The appearance gate is evaluated directly
+# on the raw rectangular crop using its own bbox aspect ratio, so it is not
+# weakened by a poor segmentation contour. Orange is deliberately excluded.
+RIPE_MANGO_MORPH_RESCUE_MIN_CONF = 0.80
+RIPE_MANGO_MORPH_RESCUE_MIN_PATTERN_SCORE = 0.88
+
 # NOT part of the ASS port -- added per explicit instruction. choose_cnn_override
 # only ever corrects YOLO into Mango/Strawberry (classes it was never trained
 # on); it has no rule for YOLO confusing two classes it DOES know (e.g. a real
@@ -215,6 +253,156 @@ def calculate_red_ratio(roi, mask=None):
     if total <= 0:
         return 0.0
     return cv2.countNonZero(red_mask) / total
+
+
+
+def calculate_ripe_mango_pattern(roi, mask, aspect, circularity):
+    """
+    Detect the very specific appearance of a common ripe mango that transitions
+    from red in the upper half to yellow/orange in the lower half.
+
+    This is deliberately narrow. It is NOT a generic "red + yellow = mango"
+    rule. It also requires an elongated mango-like shape and a strong vertical
+    colour gradient, so ordinary round red/yellow apples remain protected.
+
+    Returns:
+        (matched: bool, score: float, metrics: dict)
+    """
+    metrics = {
+        "red_ratio": 0.0,
+        "yellow_ratio": 0.0,
+        "top_red_ratio": 0.0,
+        "bottom_red_ratio": 0.0,
+        "top_yellow_ratio": 0.0,
+        "bottom_yellow_ratio": 0.0,
+        "red_gradient": 0.0,
+        "yellow_gradient": 0.0,
+    }
+
+    if roi is None or roi.size == 0:
+        return False, 0.0, metrics
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    # Use the pipeline's own segmentation mask when available. If it is not
+    # usable, fall back only to chromatic pixels; white/black background then
+    # contributes almost nothing.
+    if (
+        isinstance(mask, np.ndarray)
+        and mask.shape[:2] == roi.shape[:2]
+        and cv2.countNonZero(mask) > 0
+    ):
+        base = mask > 0
+    else:
+        base = np.ones(roi.shape[:2], dtype=bool)
+
+    chromatic = (
+        base
+        & (sat >= 45)
+        & (val >= 40)
+    )
+
+    ys, xs = np.where(chromatic)
+    if len(xs) < 250:
+        return False, 0.0, metrics
+
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+
+    if y1 <= y0 or x1 <= x0:
+        return False, 0.0, metrics
+
+    yy = np.indices(chromatic.shape)[0]
+    top_limit = y0 + int((y1 - y0) * 0.45)
+    bottom_start = y0 + int((y1 - y0) * 0.55)
+
+    top = chromatic & (yy <= top_limit)
+    bottom = chromatic & (yy >= bottom_start)
+
+    if np.count_nonzero(top) < 80 or np.count_nonzero(bottom) < 80:
+        return False, 0.0, metrics
+
+    red = (
+        chromatic
+        & (((hue <= 8) | (hue >= 170)))
+        & (sat >= 75)
+        & (val >= 45)
+    )
+
+    yellow_orange = (
+        chromatic
+        & (hue >= 8)
+        & (hue <= 38)
+        & (sat >= 55)
+        & (val >= 55)
+    )
+
+    def _ratio(candidate, region):
+        denom = int(np.count_nonzero(region))
+        if denom <= 0:
+            return 0.0
+        return float(np.count_nonzero(candidate & region) / denom)
+
+    metrics["red_ratio"] = _ratio(red, chromatic)
+    metrics["yellow_ratio"] = _ratio(yellow_orange, chromatic)
+    metrics["top_red_ratio"] = _ratio(red, top)
+    metrics["bottom_red_ratio"] = _ratio(red, bottom)
+    metrics["top_yellow_ratio"] = _ratio(yellow_orange, top)
+    metrics["bottom_yellow_ratio"] = _ratio(yellow_orange, bottom)
+    metrics["red_gradient"] = (
+        metrics["top_red_ratio"] - metrics["bottom_red_ratio"]
+    )
+    metrics["yellow_gradient"] = (
+        metrics["bottom_yellow_ratio"] - metrics["top_yellow_ratio"]
+    )
+
+    shape_ok = (
+        aspect >= RIPE_MANGO_MIN_ASPECT
+        and (
+            circularity is None
+            or circularity <= RIPE_MANGO_MAX_CIRCULARITY
+        )
+    )
+
+    colour_ok = (
+        0.15 <= metrics["red_ratio"] <= 0.75
+        and metrics["yellow_ratio"] >= 0.20
+        and metrics["top_red_ratio"] >= 0.55
+        and metrics["bottom_yellow_ratio"] >= 0.45
+        and metrics["red_gradient"] >= 0.25
+        and metrics["yellow_gradient"] >= 0.25
+    )
+
+    if not (shape_ok and colour_ok):
+        return False, 0.0, metrics
+
+    def _clamp01(v):
+        return max(0.0, min(1.0, float(v)))
+
+    evidence = [
+        _clamp01((aspect - 1.25) / 0.25),
+        _clamp01((metrics["top_red_ratio"] - 0.55) / 0.35),
+        _clamp01((metrics["bottom_yellow_ratio"] - 0.45) / 0.40),
+        _clamp01((metrics["red_gradient"] - 0.25) / 0.45),
+        _clamp01((metrics["yellow_gradient"] - 0.25) / 0.45),
+        _clamp01(
+            (metrics["red_ratio"] + metrics["yellow_ratio"]) / 0.75
+        ),
+    ]
+
+    evidence_score = float(sum(evidence) / len(evidence))
+
+    # This is a deterministic rule score, not a neural-network probability.
+    # Keep it below 0.96 so the UI does not imply impossible certainty.
+    score = min(
+        0.95,
+        0.80 + 0.16 * evidence_score
+    )
+
+    return True, float(score), metrics
 
 
 def get_shape_values(contour, roi_width, roi_height):
@@ -412,6 +600,17 @@ def _build_cnn_rule_candidate(
     aspect, circularity = get_shape_values(local_contour, roi_w, roi_h)
     red_ratio = calculate_red_ratio(measure_roi, raw_mask)
 
+    (
+        ripe_mango_pattern,
+        ripe_mango_pattern_score,
+        ripe_mango_metrics,
+    ) = calculate_ripe_mango_pattern(
+        measure_roi,
+        raw_mask,
+        aspect,
+        circularity,
+    )
+
     # Native Orange consensus guard:
     # if YOLO + processed CNN + raw-ROI CNN all agree that this is Orange,
     # do not let shape-only/low-red Mango fallback rules overturn that
@@ -523,6 +722,36 @@ def _build_cnn_rule_candidate(
         rule_confidence = float(max(raw_cnn_conf, type_conf))
         rule_reason = "raw_roi_mango_recheck"
 
+    # STRONG RAW-ROI MANGO RESCUE (Apple/Banana YOLO only)
+    #
+    # A badly damaged/rotten Mango may look very different after isolation,
+    # so the processed CNN can be less reliable while the raw rectangular ROI
+    # still gives a very strong Mango prediction. Because the current YOLO has
+    # NO Mango class, a high-confidence Banana/Apple YOLO score is not evidence
+    # that the fruit cannot be Mango.
+    #
+    # Keep this deliberately narrow:
+    #   * only rescue YOLO Apple/Banana (NOT Orange -- preserves the existing
+    #     green/unripe-Orange protection),
+    #   * require an extremely strong raw Mango CNN score,
+    #   * require Mango-like shape,
+    #   * do not override a strongly contradictory processed CNN.
+    if (
+        rule_species != "Strawberry"
+        and yolo_species in {"Apple", "Banana"}
+        and raw_cnn_type == "Mango"
+        and raw_cnn_conf >= MANGO_RAW_RESCUE_MIN_CONF
+        and aspect >= MANGO_RAW_RESCUE_MIN_ASPECT
+        and (circularity is None or circularity < MANGO_RAW_RESCUE_MAX_CIRCULARITY)
+        and (
+            type_label == "Mango"
+            or type_conf < 0.90
+        )
+    ):
+        rule_species = "Mango"
+        rule_confidence = float(max(raw_cnn_conf, type_conf if type_label == "Mango" else 0.0))
+        rule_reason = "raw_roi_strong_mango_rescue"
+
     # BANANA -> MANGO DISAGREEMENT FALLBACK
     if (
         yolo_species == "Banana"
@@ -612,6 +841,22 @@ def _build_cnn_rule_candidate(
             rule_confidence = float(max(e["confidence"] for e in strawberry_evidence))
             rule_reason = "contained_strawberry_fragment_evidence"
 
+    # RIPE RED/YELLOW MANGO -> APPLE/BANANA RESCUE
+    #
+    # YOLO cannot output Mango at all, and some smooth red/yellow ripe mangoes
+    # can also fool the five-class CNN into Apple. Only apply this rule to
+    # Apple/Banana YOLO guesses, never Orange, and only when the mango-specific
+    # elongated shape + top-red/bottom-yellow gradient is very strong.
+    if (
+        yolo_species in {"Apple", "Banana"}
+        and rule_species not in {"Mango", "Strawberry"}
+        and ripe_mango_pattern
+        and ripe_mango_pattern_score >= RIPE_MANGO_MIN_PATTERN_SCORE
+    ):
+        rule_species = "Mango"
+        rule_confidence = float(ripe_mango_pattern_score)
+        rule_reason = "ripe_mango_colour_shape_pattern"
+
     _dbg(
         "_build_cnn_rule_candidate: "
         f"yolo={yolo_species}({yolo_confidence:.3f}) "
@@ -619,7 +864,8 @@ def _build_cnn_rule_candidate(
         f"raw_cnn={raw_cnn_type}({raw_cnn_conf:.3f}) "
         f"aspect={aspect:.3f} "
         f"circularity={'n/a' if circularity is None else f'{circularity:.3f}'} "
-        f"red={red_ratio:.3f} -> rule={rule_species}({rule_confidence:.3f}) "
+        f"red={red_ratio:.3f} ripe_mango_pattern={ripe_mango_pattern_score:.3f} "
+        f"-> rule={rule_species}({rule_confidence:.3f}) "
         f"reason={rule_reason}"
     )
 
@@ -636,6 +882,9 @@ def _build_cnn_rule_candidate(
         "aspect": aspect,
         "circularity": circularity,
         "red_ratio": red_ratio,
+        "ripe_mango_pattern": bool(ripe_mango_pattern),
+        "ripe_mango_pattern_score": float(ripe_mango_pattern_score),
+        "ripe_mango_metrics": ripe_mango_metrics,
     }
 
 
@@ -755,7 +1004,83 @@ def _classify_species(
     if morph_species is not None:
         candidates.append(("morph", morph_species, float(morph_confidence)))
 
-    if not candidates:
+    # --------------------------------------------------------------
+    # RIPE MANGO: YOLO + CNN BOTH WRONG, MORPH + APPEARANCE RESCUE
+    # --------------------------------------------------------------
+    # Real failure example:
+    #   YOLO        -> Apple 0.96
+    #   CNN + Rules -> Apple 0.99
+    #   Morph       -> Mango 0.82
+    #
+    # A normal 2-of-3 majority would force Apple, and the >=0.95 native-YOLO
+    # lock would reinforce that result. But this YOLO has no Mango class, and
+    # a smooth ripe Mango can be Apple-like to the CNN too. We therefore allow
+    # one very narrow exception BEFORE the majority/native lock:
+    #   1) YOLO and CNN/rules agree on Apple or Banana,
+    #   2) Morph independently says Mango >=80%,
+    #   3) the RAW crop itself has a strong elongated red-top/yellow-bottom
+    #      ripe-Mango appearance.
+    #
+    # The appearance check uses the raw crop's own bbox aspect ratio rather
+    # than the segmentation contour, because a poor contour can make the
+    # measured shape too round and prevent an otherwise obvious Mango rescue.
+    # Orange is intentionally excluded to preserve all existing green-orange
+    # protection rules.
+    ripe_mango_morph_rescue = False
+    ripe_mango_morph_score = 0.0
+    ripe_mango_morph_metrics = {}
+
+    if (
+        yolo_species in {"Apple", "Banana"}
+        and rule_species == yolo_species
+        and morph_species == "Mango"
+        and float(morph_confidence) >= RIPE_MANGO_MORPH_RESCUE_MIN_CONF
+        and raw_crop_bgr is not None
+        and raw_crop_bgr.size > 0
+    ):
+        raw_h, raw_w = raw_crop_bgr.shape[:2]
+        raw_bbox_aspect = max(
+            raw_w / max(1, raw_h),
+            raw_h / max(1, raw_w),
+        )
+
+        (
+            ripe_mango_morph_rescue,
+            ripe_mango_morph_score,
+            ripe_mango_morph_metrics,
+        ) = calculate_ripe_mango_pattern(
+            raw_crop_bgr,
+            raw_mask,
+            raw_bbox_aspect,
+            None,  # do not trust a possibly distorted contour circularity here
+        )
+
+        ripe_mango_morph_rescue = (
+            ripe_mango_morph_rescue
+            and ripe_mango_morph_score
+                >= RIPE_MANGO_MORPH_RESCUE_MIN_PATTERN_SCORE
+        )
+
+        _dbg(
+            "ripe_mango_morph_rescue: "
+            f"yolo={yolo_species}({yolo_confidence:.3f}) "
+            f"rule={rule_species}({rule_confidence:.3f}) "
+            f"morph={morph_species}({float(morph_confidence):.3f}) "
+            f"raw_bbox_aspect={raw_bbox_aspect:.3f} "
+            f"pattern={ripe_mango_morph_score:.3f} "
+            f"metrics={ripe_mango_morph_metrics} "
+            f"accepted={ripe_mango_morph_rescue}"
+        )
+
+    if ripe_mango_morph_rescue:
+        species = "Mango"
+        confidence = max(
+            float(morph_confidence),
+            float(ripe_mango_morph_score),
+        )
+        source = "ripe_mango_morph_appearance_rescue"
+
+    elif not candidates:
         species, confidence, source = None, 0.0, "no_species_candidate"
     else:
         # ----------------------------------------------------------
@@ -774,8 +1099,74 @@ def _classify_species(
         # it, but only when BOTH alternative voters agree AND EACH is >=95%.
         native_lock_applied = False
 
+        # ----------------------------------------------------------
+        # MANGO RESCUE BEFORE NATIVE-YOLO LOCK
+        # ----------------------------------------------------------
+        # The current YOLO cannot output Mango at all. Therefore a high
+        # Banana/Apple YOLO confidence must not automatically veto strong Mango
+        # evidence from the five-class CNN. This rescue is intentionally NOT
+        # applied to YOLO Orange because the existing dataset contains true
+        # green/unripe oranges that can look Mango-like.
+        #
+        # Accept Mango when either:
+        #   A) processed + raw CNN views BOTH say Mango with >=80%, or
+        #   B) the raw-ROI Mango rescue above fired at >=97%, optionally
+        #      strengthened by Morph V12 agreeing with Mango.
+        mango_two_view_agreement = (
+            yolo_species in {"Apple", "Banana"}
+            and rule_species == "Mango"
+            and rule["cnn_species"] == "Mango"
+            and rule["cnn_confidence"] >= MANGO_TWO_VIEW_MIN_CONF
+            and rule["raw_cnn_species"] == "Mango"
+            and rule["raw_cnn_confidence"] >= MANGO_TWO_VIEW_MIN_CONF
+        )
+
+        mango_strong_raw_rescue = (
+            yolo_species in {"Apple", "Banana"}
+            and rule_species == "Mango"
+            and rule["reason"] == "raw_roi_strong_mango_rescue"
+            and rule["raw_cnn_species"] == "Mango"
+            and rule["raw_cnn_confidence"] >= MANGO_RAW_RESCUE_MIN_CONF
+        )
+
+        mango_morph_support = (
+            morph_species == "Mango"
+            and float(morph_confidence) >= MANGO_MORPH_SUPPORT_MIN_CONF
+        )
+
+        mango_ripe_pattern_rescue = (
+            yolo_species in {"Apple", "Banana"}
+            and rule_species == "Mango"
+            and rule["reason"] == "ripe_mango_colour_shape_pattern"
+            and rule.get("ripe_mango_pattern_score", 0.0)
+                >= RIPE_MANGO_MIN_PATTERN_SCORE
+        )
+
         if (
-            yolo_species in YOLO_NATIVE_SPECIES
+            mango_two_view_agreement
+            or mango_strong_raw_rescue
+            or mango_ripe_pattern_rescue
+        ):
+            species = "Mango"
+            confidence = max(
+                rule_confidence,
+                float(rule["cnn_confidence"]),
+                float(rule["raw_cnn_confidence"]),
+                float(morph_confidence) if mango_morph_support else 0.0,
+            )
+            if mango_two_view_agreement:
+                source = "mango_rescue:two_cnn_views"
+            elif mango_strong_raw_rescue:
+                source = "mango_rescue:strong_raw_roi"
+            else:
+                source = "mango_rescue:ripe_colour_shape_pattern"
+            if mango_morph_support:
+                source += "+morph"
+            native_lock_applied = True
+
+        if (
+            not native_lock_applied
+            and yolo_species in YOLO_NATIVE_SPECIES
             and yolo_confidence >= NATIVE_YOLO_LOCK_CONF
         ):
             opposing = [
@@ -817,11 +1208,37 @@ def _classify_species(
                     s for s, _, _ in agreeing
                 ) + ")"
             else:
-                source_name, species, confidence = max(
-                    candidates,
-                    key=lambda c: c[2]
+                # ------------------------------------------------------
+                # CLOSE APPLE/BANANA vs MANGO DISAGREEMENT
+                # ------------------------------------------------------
+                # fruit_yolo_v4 has no Mango class, so in a two-voter tie
+                # (e.g. YOLO Banana 0.90 vs CNN+rules Mango 0.84, Morph no
+                # match) blindly selecting the numerically highest confidence
+                # forces a real Mango to become Banana. CNN+rules can only
+                # produce Mango after passing its Mango-specific confidence +
+                # shape safety gates. Therefore let that Mango candidate win
+                # when YOLO is Apple/Banana, YOLO is not extremely confident,
+                # and the confidence gap is small. Orange is deliberately
+                # excluded to preserve the green/unripe-orange safeguards.
+                mango_close_disagreement = (
+                    morph_species is None
+                    and yolo_species in {"Apple", "Banana"}
+                    and rule_species == "Mango"
+                    and rule_confidence >= MANGO_SINGLE_RULE_MIN_CONF
+                    and yolo_confidence <= MANGO_SINGLE_RULE_MAX_YOLO_CONF
+                    and (yolo_confidence - rule_confidence) <= MANGO_SINGLE_RULE_MAX_YOLO_GAP
                 )
-                source = f"no_majority_highest_conf:{source_name}"
+
+                if mango_close_disagreement:
+                    species = "Mango"
+                    confidence = rule_confidence
+                    source = "mango_rescue:close_cnn_rule_disagreement"
+                else:
+                    source_name, species, confidence = max(
+                        candidates,
+                        key=lambda c: c[2]
+                    )
+                    source = f"no_majority_highest_conf:{source_name}"
 
     _dbg(
         f"_classify_species: candidates=[{', '.join(f'{s}={sp}({c:.3f})' for s, sp, c in candidates)}] "
@@ -1079,7 +1496,21 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
 
     if species in DEFECT_SUPPORTED_SPECIES:
         try:
-            defect_out = detect_defect(raw_crop_bgr, species)
+            # Mango defect detection can reuse the segmentation boundary that
+            # the overall pipeline already computed for this ROI. This avoids
+            # re-admitting leaves/background/crop corners into the Mango mask.
+            # Other fruit types keep their exact existing call path.
+            if species == "Mango":
+                defect_out = detect_defect(
+                    raw_crop_bgr,
+                    species,
+                    fruit_mask_hint=type_mask,
+                )
+            else:
+                defect_out = detect_defect(
+                    raw_crop_bgr,
+                    species,
+                )
             # defect_detection.py's helpers mostly return (annotated, mask, percentage);
             # be defensive since this module was built independently and not touched here.
             if isinstance(defect_out, tuple) and len(defect_out) >= 1:

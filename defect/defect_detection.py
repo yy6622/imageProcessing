@@ -575,18 +575,30 @@ def calculate_defect(
 
 def detect_banana_defect(roi):
     """
-    Detects banana defects:
-    - brown rot
-    - dark brown rot
-    - black damaged peel
-    - gray / white mould
+    Robust banana-only defect detection.
 
-    Healthy yellow / green peel and common
-    shadows are reduced.
+    Designed for common YOLO banana crops containing:
+    - yellow / ripe bananas
+    - green / unripe bananas
+    - heavily spotted bananas
+    - dark / overripe bananas
+    - brown / black rot
+    - gray / white mould
+    - shadows
+    - a hand or warm background touching the banana
+    - tight YOLO crops where the fruit reaches the ROI border
+
+    IMPORTANT:
+    Only the banana pipeline is changed.
+    Apple and orange detection remain untouched.
     """
 
+    if roi is None or roi.size == 0:
+        empty_mask = np.zeros((1, 1), dtype=np.uint8)
+        return roi, empty_mask, 0.0
+
     # ------------------------------------------------------
-    # Blur
+    # Blur / colour spaces
     # ------------------------------------------------------
 
     blurred = cv.GaussianBlur(
@@ -600,6 +612,32 @@ def detect_banana_defect(roi):
         cv.COLOR_BGR2HSV
     )
 
+    lab = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2LAB
+    )
+
+    ycrcb = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2YCrCb
+    )
+
+    gray = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2GRAY
+    )
+
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    lab_b = lab[:, :, 2]
+
+    cr = ycrcb[:, :, 1]
+    cb = ycrcb[:, :, 2]
+
+    h, w = hue.shape
+
     kernel = np.ones(
         (5, 5),
         np.uint8
@@ -607,105 +645,510 @@ def detect_banana_defect(roi):
 
 
     # ======================================================
-    # 1. Banana Fruit Mask
+    # 1. ROBUST BANANA FRUIT MASK
     # ======================================================
+    #
+    # The old version started with:
+    #
+    #     saturation > 20 and value > 10
+    #
+    # which is too broad and can join a hand / table / shadow
+    # to the banana when they touch.
+    #
+    # This version:
+    # 1. Finds high-confidence banana-coloured seed pixels.
+    # 2. Suppresses likely skin only for boundary construction.
+    # 3. Keeps the dominant seed BEFORE any aggressive closing.
+    # 4. Grows only through plausible banana pixels.
+    # 5. Uses a fallback for very dark / overripe bananas.
+    # 6. Fills enclosed dark spots after the boundary is found.
 
-    hue = hsv[:, :, 0]
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
 
-    rough_mask = np.zeros(
-        saturation.shape,
+    # ------------------------------------------------------
+    # 1A. High-confidence yellow / pale-yellow / green seed
+    # ------------------------------------------------------
+
+    yellow_core = (
+        (hue >= 15)
+        & (hue <= 40)
+        & (saturation >= 55)
+        & (value >= 35)
+        & (lab_b >= 145)
+        & (cb <= 108)
+    )
+
+    pale_yellow_core = (
+        (hue >= 18)
+        & (hue <= 38)
+        & (saturation >= 25)
+        & (saturation < 120)
+        & (value >= 80)
+        & (lab_b >= 148)
+        & (cb <= 112)
+    )
+
+    green_core = (
+        (hue >= 35)
+        & (hue <= 95)
+        & (saturation >= 45)
+        & (value >= 25)
+        & (cb <= 118)
+    )
+
+    core_mask = np.zeros(
+        (h, w),
         dtype=np.uint8
     )
 
-    # Banana coloured / dark skin
-    rough_mask[
-        (saturation > 20)
-        & (value > 10)
+    core_mask[
+        yellow_core
+        | pale_yellow_core
+        | green_core
     ] = 255
 
 
     # ------------------------------------------------------
-    # Remove blue / cyan background
+    # 1B. Suppress likely hand / warm skin-like background
     # ------------------------------------------------------
+    #
+    # This is ONLY for finding the banana boundary.
+    # It does not directly remove defect pixels from the fruit.
 
-    blue_background = (
-        (hue >= 80)
-        & (hue <= 130)
-        & (saturation > 40)
+    skin_like = (
+        (hue <= 30)
+        & (saturation >= 20)
+        & (saturation <= 200)
+        & (cr >= 130)
+        & (cr <= 185)
+        & (cb >= 100)
+        & (cb <= 140)
+        & (lab_b <= 165)
     )
 
-    rough_mask[
-        blue_background
+    skin_mask = np.zeros(
+        (h, w),
+        dtype=np.uint8
+    )
+
+    skin_mask[
+        skin_like
+    ] = 255
+
+    # Strong banana evidence overrides the skin rule.
+    skin_mask[
+        core_mask > 0
     ] = 0
 
 
     # ------------------------------------------------------
-    # Clean mask
+    # 1C. Clean seed and keep dominant component FIRST
     # ------------------------------------------------------
 
-    rough_mask = cv.morphologyEx(
-        rough_mask,
-        cv.MORPH_CLOSE,
-        kernel,
-        iterations=3
+    core_mask = cv.morphologyEx(
+        core_mask,
+        cv.MORPH_OPEN,
+        np.ones(
+            (3, 3),
+            np.uint8
+        ),
+        iterations=1
     )
 
-    rough_mask = cv.morphologyEx(
-        rough_mask,
+    (
+        component_count,
+        component_labels,
+        component_stats,
+        component_centroids
+    ) = cv.connectedComponentsWithStats(
+        core_mask,
+        connectivity=8
+    )
+
+    seed_mask = np.zeros_like(
+        core_mask
+    )
+
+    if component_count > 1:
+
+        centre_x = w / 2.0
+        centre_y = h / 2.0
+
+        diagonal = max(
+            1.0,
+            float(
+                np.hypot(
+                    w,
+                    h
+                )
+            )
+        )
+
+        minimum_seed_area = max(
+            20,
+            int(
+                h
+                * w
+                * 0.0005
+            )
+        )
+
+        best_label = None
+        best_score = -1.0
+
+        for label in range(
+            1,
+            component_count
+        ):
+
+            area = component_stats[
+                label,
+                cv.CC_STAT_AREA
+            ]
+
+            if area < minimum_seed_area:
+                continue
+
+            cx, cy = component_centroids[
+                label
+            ]
+
+            centre_distance = (
+                np.hypot(
+                    cx - centre_x,
+                    cy - centre_y
+                )
+                / diagonal
+            )
+
+            # Area is the main factor.
+            # Centre location is only a small tie-breaker.
+            score = (
+                float(area)
+                * (
+                    1.0
+                    - 0.35
+                    * centre_distance
+                )
+            )
+
+            if score > best_score:
+                best_score = score
+                best_label = label
+
+        if best_label is not None:
+
+            seed_mask[
+                component_labels
+                == best_label
+            ] = 255
+
+
+    # ------------------------------------------------------
+    # 1D. Create broader banana candidate
+    # ------------------------------------------------------
+    #
+    # Includes yellow/green peel plus dark rotten peel.
+    # Pale mould is accepted only when it has rough texture.
+
+    broad_yellow = (
+        (hue >= 8)
+        & (hue <= 45)
+        & (saturation >= 22)
+        & (value >= 18)
+        & (cb <= 125)
+    )
+
+    broad_green = (
+        (hue >= 30)
+        & (hue <= 100)
+        & (saturation >= 25)
+        & (value >= 18)
+        & (cb <= 130)
+    )
+
+    dark_peel = (
+        (value <= 115)
+        & (saturation >= 18)
+        & (cb <= 132)
+    )
+
+    boundary_laplacian = cv.Laplacian(
+        gray,
+        cv.CV_32F,
+        ksize=3
+    )
+
+    boundary_texture = np.clip(
+        np.abs(
+            boundary_laplacian
+        ),
+        0,
+        255
+    ).astype(
+        np.uint8
+    )
+
+    _, boundary_texture_mask = cv.threshold(
+        boundary_texture,
+        11,
+        255,
+        cv.THRESH_BINARY
+    )
+
+    boundary_texture_mask = cv.dilate(
+        boundary_texture_mask,
+        np.ones(
+            (3, 3),
+            np.uint8
+        ),
+        iterations=1
+    )
+
+    pale_mould_candidate = (
+        (saturation <= 110)
+        & (value >= 40)
+        & (value <= 240)
+        & (boundary_texture_mask > 0)
+    )
+
+    candidate_mask = np.zeros_like(
+        core_mask
+    )
+
+    candidate_mask[
+        broad_yellow
+        | broad_green
+        | dark_peel
+        | pale_mould_candidate
+    ] = 255
+
+    # Remove likely skin/background, but keep strong banana seed.
+    candidate_mask[
+        skin_mask > 0
+    ] = 0
+
+    candidate_mask[
+        core_mask > 0
+    ] = 255
+
+    # Remove obvious blue/cyan background.
+    blue_background = (
+        (hue >= 85)
+        & (hue <= 135)
+        & (saturation > 35)
+    )
+
+    candidate_mask[
+        blue_background
+    ] = 0
+
+    candidate_mask = cv.morphologyEx(
+        candidate_mask,
         cv.MORPH_OPEN,
-        kernel,
+        np.ones(
+            (3, 3),
+            np.uint8
+        ),
         iterations=1
     )
 
 
-    contours, _ = cv.findContours(
-        rough_mask,
-        cv.RETR_EXTERNAL,
-        cv.CHAIN_APPROX_SIMPLE
+    # ------------------------------------------------------
+    # 1E. Fallback for very dark / severely overripe banana
+    # ------------------------------------------------------
+
+    seed_pixels = cv.countNonZero(
+        seed_mask
     )
 
-    fruit_mask = np.zeros(
-        roi.shape[:2],
+    minimum_useful_seed = max(
+        80,
+        int(
+            h
+            * w
+            * 0.01
+        )
+    )
+
+    if seed_pixels < minimum_useful_seed:
+
+        (
+            fallback_count,
+            fallback_labels,
+            fallback_stats,
+            _
+        ) = cv.connectedComponentsWithStats(
+            candidate_mask,
+            connectivity=8
+        )
+
+        if fallback_count > 1:
+
+            fallback_label = (
+                1
+                + np.argmax(
+                    fallback_stats[
+                        1:,
+                        cv.CC_STAT_AREA
+                    ]
+                )
+            )
+
+            seed_mask[
+                fallback_labels
+                == fallback_label
+            ] = 255
+
+
+    # ------------------------------------------------------
+    # 1F. Region-grow only through plausible banana pixels
+    # ------------------------------------------------------
+
+    grown_mask = seed_mask.copy()
+
+    grow_kernel = np.ones(
+        (3, 3),
+        np.uint8
+    )
+
+    for _ in range(
+        max(
+            h,
+            w
+        )
+    ):
+
+        expanded_mask = cv.dilate(
+            grown_mask,
+            grow_kernel,
+            iterations=1
+        )
+
+        expanded_mask = cv.bitwise_and(
+            expanded_mask,
+            candidate_mask
+        )
+
+        if np.array_equal(
+            expanded_mask,
+            grown_mask
+        ):
+            break
+
+        grown_mask = expanded_mask
+
+
+    # ------------------------------------------------------
+    # 1G. Keep final largest fruit body
+    # ------------------------------------------------------
+
+    grown_mask = cv.morphologyEx(
+        grown_mask,
+        cv.MORPH_CLOSE,
+        np.ones(
+            (5, 5),
+            np.uint8
+        ),
+        iterations=2
+    )
+
+    (
+        grown_count,
+        grown_labels,
+        grown_stats,
+        _
+    ) = cv.connectedComponentsWithStats(
+        grown_mask,
+        connectivity=8
+    )
+
+    fruit_mask = np.zeros_like(
+        grown_mask
+    )
+
+    if grown_count > 1:
+
+        fruit_label = (
+            1
+            + np.argmax(
+                grown_stats[
+                    1:,
+                    cv.CC_STAT_AREA
+                ]
+            )
+        )
+
+        fruit_mask[
+            grown_labels
+            == fruit_label
+        ] = 255
+
+
+    # ------------------------------------------------------
+    # 1H. Fill enclosed dark spots / holes
+    # ------------------------------------------------------
+    #
+    # Padding ensures floodFill starts in true background
+    # even when the banana touches the YOLO crop edge.
+
+    padded_mask = cv.copyMakeBorder(
+        fruit_mask,
+        1,
+        1,
+        1,
+        1,
+        cv.BORDER_CONSTANT,
+        value=0
+    )
+
+    flooded = padded_mask.copy()
+
+    flood_helper = np.zeros(
+        (
+            padded_mask.shape[0] + 2,
+            padded_mask.shape[1] + 2
+        ),
         dtype=np.uint8
     )
 
-    if contours:
-
-        largest = max(
-            contours,
-            key=cv.contourArea
-        )
-
-        cv.drawContours(
-            fruit_mask,
-            [largest],
-            -1,
-            255,
-            cv.FILLED
-        )
-
-
-    # ------------------------------------------------------
-    # Final blue background removal
-    # ------------------------------------------------------
-
-    blue_mask = cv.inRange(
-        hsv,
-        np.array([80, 40, 0]),
-        np.array([130, 255, 255])
+    cv.floodFill(
+        flooded,
+        flood_helper,
+        (0, 0),
+        255
     )
 
-    fruit_mask[
-        blue_mask > 0
-    ] = 0
+    enclosed_holes = cv.bitwise_not(
+        flooded
+    )
 
+    padded_mask = cv.bitwise_or(
+        padded_mask,
+        enclosed_holes
+    )
 
-    # Remove a small outer edge
+    fruit_mask = padded_mask[
+        1:-1,
+        1:-1
+    ]
+
+    fruit_mask = cv.morphologyEx(
+        fruit_mask,
+        cv.MORPH_CLOSE,
+        np.ones(
+            (5, 5),
+            np.uint8
+        ),
+        iterations=1
+    )
+
+    # Only a tiny edge erosion.
     fruit_mask = cv.erode(
         fruit_mask,
-        kernel,
+        np.ones(
+            (3, 3),
+            np.uint8
+        ),
         iterations=1
     )
 
@@ -713,7 +1156,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 2. Brown Defect
     # ======================================================
-
     brown_mask = cv.inRange(
         hsv,
         np.array(
@@ -728,7 +1170,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 3. Dark Brown Defect
     # ======================================================
-
     dark_brown_mask = cv.inRange(
         hsv,
         np.array(
@@ -743,7 +1184,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 4. Very Black Defect
     # ======================================================
-
     very_black_mask = cv.inRange(
         hsv,
         np.array(
@@ -758,7 +1198,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 5. Gray / White Mould
     # ======================================================
-
     mold_mask = cv.inRange(
         hsv,
         np.array(
@@ -792,7 +1231,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 6. Healthy Yellow Peel
     # ======================================================
-
     yellow_healthy_mask = cv.inRange(
         hsv,
         np.array(
@@ -807,7 +1245,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 7. Yellow Peel Under Shadow
     # ======================================================
-
     yellow_shadow_mask = cv.inRange(
         hsv,
         np.array(
@@ -822,7 +1259,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 8. Healthy Green Peel
     # ======================================================
-
     green_healthy_mask = cv.inRange(
         hsv,
         np.array(
@@ -837,7 +1273,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 9. Combine Defects
     # ======================================================
-
     dark_mask = cv.bitwise_or(
         dark_brown_mask,
         very_black_mask
@@ -858,7 +1293,6 @@ def detect_banana_defect(roi):
     # ------------------------------------------------------
     # Remove healthy yellow
     # ------------------------------------------------------
-
     defect_mask = cv.bitwise_and(
         defect_mask,
         cv.bitwise_not(
@@ -870,7 +1304,6 @@ def detect_banana_defect(roi):
     # ------------------------------------------------------
     # Remove yellow shadow
     # ------------------------------------------------------
-
     defect_mask = cv.bitwise_and(
         defect_mask,
         cv.bitwise_not(
@@ -882,7 +1315,6 @@ def detect_banana_defect(roi):
     # ------------------------------------------------------
     # Remove healthy green
     # ------------------------------------------------------
-
     defect_mask = cv.bitwise_and(
         defect_mask,
         cv.bitwise_not(
@@ -894,7 +1326,6 @@ def detect_banana_defect(roi):
     # ======================================================
     # 10. Inner Fruit Mask
     # ======================================================
-
     inner_fruit_mask = cv.erode(
         fruit_mask,
         kernel,
@@ -906,23 +1337,29 @@ def detect_banana_defect(roi):
         inner_fruit_mask
     )
 
+    # Preserve a copy BEFORE opening. Small real banana freckles/spots
+    # can disappear during morphology, so we recover only compact,
+    # dark components from this source later.
+    compact_spot_source = defect_mask.copy()
+
 
     # ======================================================
     # 11. Morphological Processing
     # ======================================================
-
+    # IMPORTANT: keep this modest. A large CLOSE can connect many
+    # individual banana spots into one unnatural long red region.
     defect_mask = cv.morphologyEx(
         defect_mask,
         cv.MORPH_OPEN,
-        kernel,
+        np.ones((3, 3), np.uint8),
         iterations=1
     )
 
     defect_mask = cv.morphologyEx(
         defect_mask,
         cv.MORPH_CLOSE,
-        kernel,
-        iterations=2
+        np.ones((3, 3), np.uint8),
+        iterations=1
     )
 
     defect_mask = cv.bitwise_and(
@@ -932,13 +1369,88 @@ def detect_banana_defect(roi):
 
 
     # ======================================================
-    # 12. Remove Tiny Noise
+    # 12. Component cleanup + small spot recovery
     # ======================================================
-
-    cleaned_mask = np.zeros_like(
-        defect_mask
+    fruit_pixels = cv.countNonZero(
+        fruit_mask
     )
 
+    min_defect_area = max(
+        12,
+        int(fruit_pixels * 0.00035)
+    )
+
+    # Accurate distance-to-boundary even when the banana touches the
+    # YOLO crop border. OpenCV distanceTransform does not treat pixels
+    # outside the image as background, so pad with a black frame first.
+    padded_for_distance = cv.copyMakeBorder(
+        fruit_mask,
+        1, 1, 1, 1,
+        cv.BORDER_CONSTANT,
+        value=0
+    )
+
+    boundary_distance = cv.distanceTransform(
+        padded_for_distance,
+        cv.DIST_L2,
+        5
+    )[1:-1, 1:-1]
+
+    edge_band = max(
+        10,
+        int(min(h, w) * 0.085)
+    )
+
+    def keep_banana_component(contour, source_mask, min_area, allow_small=False):
+        area = cv.contourArea(contour)
+        if area < min_area:
+            return False
+
+        x, y, cw, ch = cv.boundingRect(contour)
+        elongation = max(cw, ch) / max(1.0, float(min(cw, ch)))
+
+        component_mask = np.zeros_like(source_mask)
+        cv.drawContours(component_mask, [contour], -1, 255, cv.FILLED)
+        component_pixels = cv.countNonZero(component_mask)
+        if component_pixels == 0:
+            return False
+
+        component_distances = boundary_distance[component_mask > 0]
+        edge_fraction = float(np.mean(component_distances < edge_band))
+
+        # False hand/contact shadows typically form a long strip following
+        # the banana edge. Reject only when BOTH strongly edge-hugging and
+        # elongated, so compact genuine defects near the edge still survive.
+        area_fraction = component_pixels / max(1.0, float(fruit_pixels))
+        edge_strip_artifact = (
+            edge_fraction >= 0.82
+            and elongation >= 2.6
+            and area_fraction < 0.08
+        )
+
+        if edge_strip_artifact:
+            return False
+
+        # Anything almost completely cut by the crop edge and very narrow
+        # is normally ROI/background leakage.
+        touches_roi = (
+            x <= 1 or y <= 1
+            or x + cw >= w - 1
+            or y + ch >= h - 1
+        )
+        if touches_roi and edge_fraction >= 0.90 and elongation >= 2.2:
+            return False
+
+        if allow_small:
+            bbox_area = max(1, cw * ch)
+            extent = area / bbox_area
+            if extent < 0.18:
+                return False
+
+        return True
+
+    # ---------------- main / larger defect regions ----------------
+    cleaned_main = np.zeros_like(defect_mask)
     contours, _ = cv.findContours(
         defect_mask,
         cv.RETR_EXTERNAL,
@@ -946,48 +1458,98 @@ def detect_banana_defect(roi):
     )
 
     for contour in contours:
-
-        area = cv.contourArea(
-            contour
-        )
-
-        if area > 60:
-
+        if keep_banana_component(
+            contour,
+            defect_mask,
+            min_defect_area
+        ):
             cv.drawContours(
-                cleaned_mask,
+                cleaned_main,
                 [contour],
                 -1,
                 255,
                 cv.FILLED
             )
 
+    # ---------------- recover genuine small dark spots ----------------
+    # Use the pre-opening source, then keep only compact components. This
+    # recovers small black/brown banana spots without re-introducing the
+    # long hand-contact shadow.
+    spot_mask = cv.bitwise_and(
+        compact_spot_source,
+        cv.inRange(
+            hsv,
+            np.array([0, 45, 0]),
+            np.array([35, 255, 115])
+        )
+    )
 
-    defect_mask = cleaned_mask
+    spot_mask = cv.bitwise_and(
+        spot_mask,
+        inner_fruit_mask
+    )
+
+    spot_mask = cv.morphologyEx(
+        spot_mask,
+        cv.MORPH_CLOSE,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    cleaned_spots = np.zeros_like(spot_mask)
+    spot_min_area = max(
+        4,
+        int(fruit_pixels * 0.00010)
+    )
+    spot_max_area = max(
+        80,
+        int(fruit_pixels * 0.012)
+    )
+
+    spot_contours, _ = cv.findContours(
+        spot_mask,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    for contour in spot_contours:
+        area = cv.contourArea(contour)
+        if area > spot_max_area:
+            continue
+        if keep_banana_component(
+            contour,
+            spot_mask,
+            spot_min_area,
+            allow_small=True
+        ):
+            cv.drawContours(
+                cleaned_spots,
+                [contour],
+                -1,
+                255,
+                cv.FILLED
+            )
+
+    defect_mask = cv.bitwise_or(
+        cleaned_main,
+        cleaned_spots
+    )
 
     defect_mask = cv.bitwise_and(
         defect_mask,
         inner_fruit_mask
     )
 
-
     # ======================================================
     # 13. Calculate Defect Percentage
     # ======================================================
-
-    fruit_pixels = cv.countNonZero(
-        fruit_mask
-    )
-
     defect_pixels = cv.countNonZero(
         defect_mask
     )
 
     if fruit_pixels == 0:
-
         defect_percentage = 0.0
-
     else:
-
         defect_percentage = (
             defect_pixels
             / fruit_pixels
@@ -1002,36 +1564,21 @@ def detect_banana_defect(roi):
     # ======================================================
     # 14. Draw Defects
     # ======================================================
-    #
-    # DISPLAY-ONLY cleanup:
-    #
-    # IMPORTANT:
-    # Do NOT contour a defect mask AFTER clipping it with an inner
-    # fruit mask. Doing that creates a new artificial contour exactly
-    # along the inner clipping boundary, which is why a long red line
-    # still appeared parallel to the banana outline.
-    #
-    # Instead:
-    # 1. Find contours from the ORIGINAL defect mask.
-    # 2. Draw those contour lines into a temporary line mask.
-    # 3. Remove only contour pixels that are too close to the banana
-    #    outer boundary.
-    #
-    # The defect percentage is NOT changed.
-
+    # DISPLAY ONLY:
+    # Draw the real defect contours, then hide only contour pixels that
+    # are too close to the outer banana boundary. This avoids the long
+    # artificial red line that can follow the fruit/ROI edge.
     output = roi.copy()
 
-    display_distance = cv.distanceTransform(
-        fruit_mask,
-        cv.DIST_L2,
-        5
-    )
+    # Reuse the padded distance map from cleanup so ROI-border pixels
+    # are correctly considered close to the banana boundary too.
+    display_distance = boundary_distance
 
     h, w = fruit_mask.shape
 
     display_margin = max(
-        10,
-        int(min(h, w) * 0.055)
+        7,
+        int(min(h, w) * 0.045)
     )
 
     display_inner_mask = np.zeros_like(
@@ -1042,7 +1589,6 @@ def detect_banana_defect(roi):
         display_distance >= display_margin
     ] = 255
 
-    # Draw ORIGINAL defect contour lines first.
     contour_line_mask = np.zeros_like(
         defect_mask
     )
@@ -1054,9 +1600,7 @@ def detect_banana_defect(roi):
     )
 
     for contour in original_defect_contours:
-
-        if cv.contourArea(contour) > 60:
-
+        if cv.contourArea(contour) >= min_defect_area:
             cv.drawContours(
                 contour_line_mask,
                 [contour],
@@ -1065,9 +1609,6 @@ def detect_banana_defect(roi):
                 2
             )
 
-    # Remove only the red LINE pixels near the fruit boundary.
-    # This avoids creating a new artificial red line at the clipping
-    # boundary while preserving genuine internal defect boundaries.
     contour_line_mask = cv.bitwise_and(
         contour_line_mask,
         display_inner_mask
@@ -1097,114 +1638,265 @@ def detect_apple_wrinkles(
     fruit_mask
 ):
     """
-    Detects wrinkle / shrivel texture on apple skin.
+    Detect meaningful apple wrinkle / shrivel clusters while avoiding
+    normal red/yellow/green skin colour transitions.
 
-    Healthy smooth apple:
-        low wrinkle percentage
-
-    Old / shrivelled apple:
-        higher wrinkle percentage
+    Key idea:
+    - Wrinkles are narrow dark ridges caused mostly by LIGHTNESS change.
+    - Natural apple pigmentation changes colour/chroma as well.
+    - Therefore we use a Hessian ridge test in Lab space and require
+      local colour/chroma similarity before a pixel can become a wrinkle.
+    - Only dense local clusters are kept; isolated texture is discarded.
     """
 
     # ------------------------------------------------------
-    # Convert to grayscale
+    # 1. Lab colour space
     # ------------------------------------------------------
 
-    gray = cv.cvtColor(
+    smoothed = cv.GaussianBlur(
         roi,
-        cv.COLOR_BGR2GRAY
-    )
-
-
-    # ------------------------------------------------------
-    # Blur small noise
-    # ------------------------------------------------------
-
-    blurred = cv.GaussianBlur(
-        gray,
-        (5, 5),
+        (3, 3),
         0
     )
 
+    lab = cv.cvtColor(
+        smoothed,
+        cv.COLOR_BGR2LAB
+    )
 
-    # ------------------------------------------------------
-    # Canny edge detection
-    # Wrinkles create many small edges
-    # ------------------------------------------------------
-
-    edges = cv.Canny(
-        blurred,
-        70,
-        150
+    lightness, channel_a, channel_b = cv.split(
+        lab
     )
 
 
     # ------------------------------------------------------
-    # Remove outside edge of apple
+    # 2. Hessian ridge response
     # ------------------------------------------------------
+    # A real crease behaves like a thin dark ridge. One Hessian
+    # eigenvalue becomes strong while the other stays much smaller.
 
-    edge_kernel = np.ones(
-        (7, 7),
-        np.uint8
+    light_float = cv.GaussianBlur(
+        lightness,
+        (5, 5),
+        1.2
+    ).astype(np.float32)
+
+    dxx = cv.Sobel(
+        light_float,
+        cv.CV_32F,
+        2,
+        0,
+        ksize=3
     )
 
-    inner_mask = cv.erode(
+    dyy = cv.Sobel(
+        light_float,
+        cv.CV_32F,
+        0,
+        2,
+        ksize=3
+    )
+
+    dxy = cv.Sobel(
+        light_float,
+        cv.CV_32F,
+        1,
+        1,
+        ksize=3
+    )
+
+    trace = dxx + dyy
+
+    root = np.sqrt(
+        (dxx - dyy) ** 2
+        + 4.0 * (dxy ** 2)
+    )
+
+    eigen_1 = (trace - root) / 2.0
+    eigen_2 = (trace + root) / 2.0
+
+    swap = np.abs(eigen_1) > np.abs(eigen_2)
+
+    eigen_small = np.where(
+        swap,
+        eigen_2,
+        eigen_1
+    )
+
+    eigen_large = np.where(
+        swap,
+        eigen_1,
+        eigen_2
+    )
+
+    ridge_ratio = (
+        np.abs(eigen_small)
+        / (np.abs(eigen_large) + 1e-3)
+    )
+
+
+    # ------------------------------------------------------
+    # 3. Reject normal colour-pattern edges
+    # ------------------------------------------------------
+    # A wrinkle should be darker than its local neighbourhood but
+    # should not strongly change Lab chroma values.
+
+    local_l = cv.GaussianBlur(
+        lightness,
+        (17, 17),
+        0
+    ).astype(np.int16)
+
+    local_a = cv.GaussianBlur(
+        channel_a,
+        (17, 17),
+        0
+    ).astype(np.int16)
+
+    local_b = cv.GaussianBlur(
+        channel_b,
+        (17, 17),
+        0
+    ).astype(np.int16)
+
+    light_drop = (
+        local_l
+        - lightness.astype(np.int16)
+    )
+
+    a_change = np.abs(
+        channel_a.astype(np.int16)
+        - local_a
+    )
+
+    b_change = np.abs(
+        channel_b.astype(np.int16)
+        - local_b
+    )
+
+    wrinkle_candidate = np.zeros_like(
+        lightness
+    )
+
+    wrinkle_candidate[
+        (eigen_large > 20)
+        & (ridge_ratio < 0.35)
+        & (light_drop >= 5)
+        & (a_change <= 10)
+        & (b_change <= 12)
+    ] = 255
+
+
+    # ------------------------------------------------------
+    # 4. Keep wrinkle analysis away from outer apple edge
+    # ------------------------------------------------------
+
+    # IMPORTANT: pad with black before distanceTransform.  When a tight
+    # YOLO crop cuts through the apple, OpenCV otherwise does not know
+    # that pixels just outside the ROI are background.  That can make
+    # border-touching apple pixels look falsely "deep" inside the fruit.
+    padded_fruit = cv.copyMakeBorder(
         fruit_mask,
-        edge_kernel,
-        iterations=2
+        1, 1, 1, 1,
+        cv.BORDER_CONSTANT,
+        value=0
     )
 
-    edges = cv.bitwise_and(
-        edges,
+    distance = cv.distanceTransform(
+        padded_fruit,
+        cv.DIST_L2,
+        5
+    )[1:-1, 1:-1]
+
+    h, w = fruit_mask.shape
+
+    wrinkle_margin = max(
+        7,
+        int(min(h, w) * 0.050)
+    )
+
+    inner_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    inner_mask[
+        distance >= wrinkle_margin
+    ] = 255
+
+    wrinkle_candidate = cv.bitwise_and(
+        wrinkle_candidate,
         inner_mask
     )
 
-
-    # ------------------------------------------------------
-    # Connect nearby wrinkle lines
-    # ------------------------------------------------------
-
-    kernel = np.ones(
-        (3, 3),
-        np.uint8
+    wrinkle_candidate = cv.morphologyEx(
+        wrinkle_candidate,
+        cv.MORPH_OPEN,
+        np.ones((2, 2), np.uint8),
+        iterations=1
     )
 
-    wrinkle_mask = cv.morphologyEx(
-        edges,
+
+    # ------------------------------------------------------
+    # 5. Require a LOCAL CLUSTER of crease pixels
+    # ------------------------------------------------------
+    # A single pigment boundary or reflection line is not enough.
+    # Shriveled skin produces many nearby ridge pixels.
+
+    ridge_float = (
+        wrinkle_candidate > 0
+    ).astype(np.float32)
+
+    local_density = cv.boxFilter(
+        ridge_float,
+        -1,
+        (21, 21),
+        normalize=True
+    )
+
+    wrinkle_region = np.zeros_like(
+        wrinkle_candidate
+    )
+
+    wrinkle_region[
+        (local_density >= 0.20)
+        & (inner_mask > 0)
+    ] = 255
+
+    wrinkle_region = cv.morphologyEx(
+        wrinkle_region,
+        cv.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    wrinkle_region = cv.morphologyEx(
+        wrinkle_region,
         cv.MORPH_CLOSE,
-        kernel,
+        np.ones((5, 5), np.uint8),
         iterations=1
     )
 
 
     # ------------------------------------------------------
-    # Slightly thicken wrinkle lines
+    # 6. Remove tiny / unrealistic wrinkle clusters
     # ------------------------------------------------------
 
-    wrinkle_mask = cv.dilate(
-        wrinkle_mask,
-        kernel,
-        iterations=1
+    fruit_pixels = max(
+        1,
+        cv.countNonZero(inner_mask)
     )
 
-
-    # Keep wrinkles inside apple
-    wrinkle_mask = cv.bitwise_and(
-        wrinkle_mask,
-        inner_mask
+    minimum_cluster_area = max(
+        30,
+        int(fruit_pixels * 0.0003)
     )
-
-
-    # ------------------------------------------------------
-    # Remove very tiny wrinkle/noise regions
-    # ------------------------------------------------------
 
     cleaned_mask = np.zeros_like(
-        wrinkle_mask
+        wrinkle_region
     )
 
     contours, _ = cv.findContours(
-        wrinkle_mask,
+        wrinkle_region,
         cv.RETR_EXTERNAL,
         cv.CHAIN_APPROX_SIMPLE
     )
@@ -1215,48 +1907,262 @@ def detect_apple_wrinkles(
             contour
         )
 
-        if area > 25:
+        if area < minimum_cluster_area:
+            continue
 
-            cv.drawContours(
-                cleaned_mask,
-                [contour],
-                -1,
-                255,
-                cv.FILLED
-            )
+        x, y, cw, ch = cv.boundingRect(
+            contour
+        )
 
+        bbox_area = max(
+            1,
+            cw * ch
+        )
 
-    wrinkle_mask = cleaned_mask
+        extent = area / bbox_area
 
+        # A huge, almost solid block is more likely to be a colour
+        # patch than a wrinkle network.
+        if (
+            area > fruit_pixels * 0.06
+            and extent > 0.65
+        ):
+            continue
 
-    # ------------------------------------------------------
-    # Calculate wrinkle percentage
-    # ------------------------------------------------------
+        cv.drawContours(
+            cleaned_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
 
-    fruit_pixels = cv.countNonZero(
-        inner_mask
-    )
 
     wrinkle_pixels = cv.countNonZero(
-        wrinkle_mask
+        cleaned_mask
     )
 
-    if fruit_pixels == 0:
+    wrinkle_percentage = (
+        wrinkle_pixels
+        / fruit_pixels
+    ) * 100.0
 
+    # Ignore very weak global wrinkle signal. This prevents a smooth
+    # patterned apple from being treated as shrivelled because of a few
+    # isolated skin lines.
+    if wrinkle_percentage < 0.35:
+
+        cleaned_mask[:] = 0
         wrinkle_percentage = 0.0
-
-    else:
-
-        wrinkle_percentage = (
-            wrinkle_pixels
-            / fruit_pixels
-        ) * 100
 
 
     return (
-        wrinkle_mask,
+        cleaned_mask,
         wrinkle_percentage
     )
+
+
+# ==========================================================
+# Apple Stem / Calyx Suppression
+# ==========================================================
+
+def get_apple_stem_calyx_mask(
+    roi,
+    fruit_mask
+):
+    """
+    Suppresses the small natural dark stem/calyx regions near the top
+    or bottom centre of an apple.
+
+    Large dark regions are NOT removed, so genuine rot near the top or
+    bottom can still be detected.
+    """
+
+    blurred = cv.GaussianBlur(
+        roi,
+        (5, 5),
+        0
+    )
+
+    hsv = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2HSV
+    )
+
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    candidate = (
+        ((value <= 95) & (saturation >= 15))
+        |
+        (
+            (hue >= 20)
+            & (hue <= 110)
+            & (saturation >= 30)
+            & (value <= 140)
+        )
+    )
+
+    candidate_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    candidate_mask[
+        candidate
+    ] = 255
+
+    candidate_mask = cv.bitwise_and(
+        candidate_mask,
+        fruit_mask
+    )
+
+
+    fruit_contours, _ = cv.findContours(
+        fruit_mask,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    if not fruit_contours:
+        return np.zeros_like(fruit_mask)
+
+    largest = max(
+        fruit_contours,
+        key=cv.contourArea
+    )
+
+    fx, fy, fw, fh = cv.boundingRect(
+        largest
+    )
+
+
+    # ------------------------------------------------------
+    # Top / bottom centre search zones
+    # ------------------------------------------------------
+
+    zone = np.zeros_like(
+        fruit_mask
+    )
+
+    top_x1 = fx + int(fw * 0.18)
+    top_x2 = fx + int(fw * 0.82)
+    top_y2 = min(
+        fruit_mask.shape[0],
+        fy + int(fh * 0.24)
+    )
+
+    zone[
+        fy:top_y2,
+        top_x1:top_x2
+    ] = 255
+
+    bottom_x1 = fx + int(fw * 0.25)
+    bottom_x2 = fx + int(fw * 0.75)
+    bottom_y1 = max(
+        0,
+        fy + fh - int(fh * 0.16)
+    )
+    bottom_y2 = min(
+        fruit_mask.shape[0],
+        fy + fh
+    )
+
+    zone[
+        bottom_y1:bottom_y2,
+        bottom_x1:bottom_x2
+    ] = 255
+
+    candidate_mask = cv.bitwise_and(
+        candidate_mask,
+        zone
+    )
+
+    candidate_mask = cv.morphologyEx(
+        candidate_mask,
+        cv.MORPH_CLOSE,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+
+    # ------------------------------------------------------
+    # Keep only small stem/calyx-like components
+    # ------------------------------------------------------
+
+    fruit_pixels = max(
+        1,
+        cv.countNonZero(fruit_mask)
+    )
+
+    maximum_area = (
+        fruit_pixels * 0.012
+    )
+
+    suppression_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    contours, _ = cv.findContours(
+        candidate_mask,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    for contour in contours:
+
+        area = cv.contourArea(
+            contour
+        )
+
+        if area < 10:
+            continue
+
+        if area > maximum_area:
+            continue
+
+        x, y, cw, ch = cv.boundingRect(
+            contour
+        )
+
+        if cw > fw * 0.22:
+            continue
+
+        if ch > fh * 0.22:
+            continue
+
+        centre_y = y + (ch / 2.0)
+
+        in_top_zone = (
+            centre_y <= fy + fh * 0.24
+        )
+
+        in_bottom_zone = (
+            centre_y >= fy + fh * 0.84
+        )
+
+        if not (
+            in_top_zone
+            or in_bottom_zone
+        ):
+            continue
+
+        cv.drawContours(
+            suppression_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+
+    suppression_mask = cv.dilate(
+        suppression_mask,
+        np.ones((5, 5), np.uint8),
+        iterations=1
+    )
+
+    return suppression_mask
 
 
 # ==========================================================
@@ -1265,57 +2171,560 @@ def detect_apple_wrinkles(
 
 def detect_apple_defect(roi):
     """
-    Detects apple defects using:
+    Robust apple defect detection.
 
-    1. Brown / dark damaged areas
-    2. Wrinkle / shrivel texture
+    Handles:
+    - brown rot / bruising
+    - black / very dark damage
+    - dark red / purple bruising
+    - olive / green rot
+    - gray / white mould with rough texture
+    - green mould
+    - genuine wrinkle / shrivel clusters
+
+    Designed to reduce false positives caused by:
+    - normal red/yellow/green apple striping
+    - smooth colour transitions
+    - reflections
+    - fruit boundary shadows
+    - natural stem / calyx regions
     """
 
     # ======================================================
-    # 1. Colour-Based Defects
-    # ======================================================
-
-    (
-        colour_output,
-        colour_mask,
-        colour_percentage
-    ) = calculate_defect(
-        roi,
-
-        lower_brown=np.array(
-            [5, 50, 20]
-        ),
-
-        upper_brown=np.array(
-            [25, 255, 170]
-        ),
-
-        dark_threshold=90
-    )
-
-
-    # ======================================================
-    # 2. Fruit Mask
+    # 1. Fruit Mask
     # ======================================================
 
     fruit_mask = get_fruit_mask(
         roi
     )
 
-    kernel = np.ones(
-        (5, 5),
-        np.uint8
-    )
+    if cv.countNonZero(fruit_mask) == 0:
 
+        return (
+            roi.copy(),
+            fruit_mask,
+            0.0
+        )
+
+
+    # Slightly remove only the extreme outer boundary.
     fruit_mask = cv.erode(
         fruit_mask,
-        kernel,
+        np.ones((3, 3), np.uint8),
         iterations=1
     )
 
 
     # ======================================================
-    # 3. Wrinkle Detection
+    # 2. Apple Interior Safe Mask
+    # ======================================================
+
+    # Pad before distanceTransform so a tight YOLO crop is treated
+    # correctly.  Without this, an apple touching the ROI border can
+    # produce false red contours along the crop edge.
+    padded_fruit = cv.copyMakeBorder(
+        fruit_mask,
+        1, 1, 1, 1,
+        cv.BORDER_CONSTANT,
+        value=0
+    )
+
+    distance = cv.distanceTransform(
+        padded_fruit,
+        cv.DIST_L2,
+        5
+    )[1:-1, 1:-1]
+
+    h, w = fruit_mask.shape
+
+    colour_margin = max(
+        8,
+        int(min(h, w) * 0.050)
+    )
+
+    colour_safe_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    colour_safe_mask[
+        distance >= colour_margin
+    ] = 255
+
+
+    # ======================================================
+    # 3. Preprocessing
+    # ======================================================
+
+    blurred = cv.GaussianBlur(
+        roi,
+        (5, 5),
+        0
+    )
+
+    hsv = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2HSV
+    )
+
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+
+    # ------------------------------------------------------
+    # Local darkness
+    # ------------------------------------------------------
+    # A bruise/rot patch is often darker than its local surrounding.
+
+    local_value = cv.GaussianBlur(
+        value,
+        (31, 31),
+        0
+    )
+
+    local_darkness = (
+        local_value.astype(np.int16)
+        - value.astype(np.int16)
+    )
+
+
+    # ------------------------------------------------------
+    # Rough texture
+    # ------------------------------------------------------
+    # Mould / damaged tissue is normally rougher than smooth healthy
+    # peel. This is only used together with colour conditions.
+
+    gray = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2GRAY
+    )
+
+    laplacian = cv.Laplacian(
+        gray,
+        cv.CV_32F,
+        ksize=3
+    )
+
+    texture_strength = np.abs(
+        laplacian
+    )
+
+    rough_texture = np.zeros_like(
+        gray
+    )
+
+    rough_texture[
+        texture_strength >= 16
+    ] = 255
+
+    rough_texture = cv.dilate(
+        rough_texture,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    rough = (
+        rough_texture > 0
+    )
+
+
+    # ======================================================
+    # 4. Colour / Damage Conditions
+    # ======================================================
+
+    # ------------------------------------------------------
+    # Brown rot / bruise
+    # ------------------------------------------------------
+    # Healthy orange/red apple striping is not accepted from colour
+    # alone. It must be strongly dark OR locally dark + rough.
+
+    brown_hue = (
+        (hue >= 4)
+        & (hue <= 30)
+        & (saturation >= 45)
+    )
+
+    brown_rot = (
+        brown_hue
+        & (
+            # Very dark brown can be accepted with only a modest local
+            # contrast; medium brown must also be locally dark and rough.
+            (
+                (value <= 100)
+                & (local_darkness >= 5)
+            )
+            |
+            (
+                (value <= 145)
+                & (local_darkness >= 14)
+                & rough
+            )
+        )
+    )
+
+
+    # ------------------------------------------------------
+    # Black / very dark damage
+    # ------------------------------------------------------
+
+    black_damage = (
+        (value <= 82)
+        & (saturation >= 15)
+    )
+
+
+    # ------------------------------------------------------
+    # Dark red bruise
+    # ------------------------------------------------------
+
+    red_bruise = (
+        (
+            (hue <= 12)
+            | (hue >= 170)
+        )
+        & (saturation >= 55)
+        & (value <= 115)
+        & (
+            # Healthy red apple peel can be naturally dark.  Require
+            # stronger local contrast or roughness unless it is extremely
+            # dark.
+            (
+                (value <= 88)
+                & (local_darkness >= 4)
+            )
+            |
+            (
+                (local_darkness >= 14)
+                & rough
+            )
+        )
+    )
+
+
+    # ------------------------------------------------------
+    # Purple / deep-red bruise
+    # ------------------------------------------------------
+
+    purple_bruise = (
+        (hue >= 135)
+        & (hue <= 179)
+        & (saturation >= 40)
+        & (value <= 115)
+        & (
+            (local_darkness >= 10)
+            | (
+                (value <= 88)
+                & rough
+            )
+        )
+    )
+
+
+    # ------------------------------------------------------
+    # Olive / green-brown rot
+    # ------------------------------------------------------
+
+    olive_rot = (
+        (hue >= 20)
+        & (hue <= 95)
+        & (saturation >= 25)
+        & (value <= 118)
+        & (
+            (local_darkness >= 8)
+            | rough
+        )
+    )
+
+
+    # ------------------------------------------------------
+    # Local dark bruise not covered well by fixed hue
+    # ------------------------------------------------------
+
+    local_bruise = (
+        (local_darkness >= 24)
+        & (value <= 165)
+        & (saturation >= 30)
+        & rough
+    )
+
+
+    # ------------------------------------------------------
+    # Gray / white mould
+    # ------------------------------------------------------
+    # Low saturation alone is NOT enough because reflections are also
+    # low-saturation. Rough texture and a local lightness change are
+    # required.
+
+    gray_mould = (
+        (saturation <= 95)
+        & (value >= 45)
+        & (value <= 205)
+        & rough
+        & (local_darkness >= 5)
+    )
+
+
+    # ------------------------------------------------------
+    # Green mould / dark green diseased tissue
+    # ------------------------------------------------------
+
+    green_mould = (
+        (hue >= 28)
+        & (hue <= 105)
+        & (saturation >= 20)
+        & (saturation <= 180)
+        & (value <= 145)
+        & rough
+        & (
+            (local_darkness >= 5)
+            | (value <= 105)
+        )
+    )
+
+
+    # ======================================================
+    # 5. Combine Colour Defects
+    # ======================================================
+
+    colour_candidate = (
+        brown_rot
+        | black_damage
+        | red_bruise
+        | purple_bruise
+        | olive_rot
+        | local_bruise
+        | gray_mould
+        | green_mould
+    )
+
+    colour_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    colour_mask[
+        colour_candidate
+    ] = 255
+
+    colour_mask = cv.bitwise_and(
+        colour_mask,
+        colour_safe_mask
+    )
+
+
+    # Conservative morphology:
+    # remove isolated noise, then connect nearby pixels inside the same
+    # damaged patch without merging the whole apple texture.
+
+    colour_mask = cv.morphologyEx(
+        colour_mask,
+        cv.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    colour_mask = cv.morphologyEx(
+        colour_mask,
+        cv.MORPH_CLOSE,
+        np.ones((5, 5), np.uint8),
+        iterations=1
+    )
+
+
+    # ======================================================
+    # 6. Adaptive Component Filtering
+    # ======================================================
+
+    fruit_pixels = max(
+        1,
+        cv.countNonZero(colour_safe_mask)
+    )
+
+    minimum_area = max(
+        25,
+        int(fruit_pixels * 0.0003)
+    )
+
+    cleaned_colour_mask = np.zeros_like(
+        colour_mask
+    )
+
+    colour_contours, _ = cv.findContours(
+        colour_mask,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    for contour in colour_contours:
+
+        area = cv.contourArea(
+            contour
+        )
+
+        if area < 8:
+            continue
+
+        component_mask = np.zeros_like(
+            colour_mask
+        )
+
+        cv.drawContours(
+            component_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        mean_value = cv.mean(
+            value,
+            mask=component_mask
+        )[0]
+
+        x, y, cw, ch = cv.boundingRect(
+            contour
+        )
+
+        bbox_area = max(
+            1,
+            cw * ch
+        )
+
+        extent = area / bbox_area
+
+        # Tiny regions are kept only when they are truly dark.
+        if (
+            area < minimum_area
+            and mean_value > 76
+        ):
+            continue
+
+        # Thin, weak streaks are usually healthy pigmentation / lighting.
+        if (
+            area < fruit_pixels * 0.002
+            and extent < 0.13
+            and mean_value > 92
+        ):
+            continue
+
+        cv.drawContours(
+            cleaned_colour_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+
+    # ------------------------------------------------------
+    # Boundary-contact cleanup
+    # ------------------------------------------------------
+    # A tight crop, stem shadow, or background contact can create a long
+    # red contour that follows the apple outline.  Reject only components
+    # that live almost entirely in the outer boundary band.  A genuine
+    # defect that starts at the edge but extends meaningfully inward is kept.
+
+    boundary_band = max(
+        7,
+        int(min(h, w) * 0.060)
+    )
+
+    deep_band = max(
+        boundary_band + 3,
+        int(min(h, w) * 0.095)
+    )
+
+    boundary_cleaned = np.zeros_like(
+        cleaned_colour_mask
+    )
+
+    boundary_contours, _ = cv.findContours(
+        cleaned_colour_mask,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    for contour in boundary_contours:
+
+        area = cv.contourArea(contour)
+
+        if area < 8:
+            continue
+
+        x, y, cw, ch = cv.boundingRect(
+            contour
+        )
+
+        component_mask = np.zeros_like(
+            cleaned_colour_mask
+        )
+
+        cv.drawContours(
+            component_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        component_distances = distance[
+            component_mask > 0
+        ]
+
+        if component_distances.size == 0:
+            continue
+
+        edge_fraction = float(
+            np.mean(component_distances < boundary_band)
+        )
+
+        deep_fraction = float(
+            np.mean(component_distances >= deep_band)
+        )
+
+        touches_roi = (
+            x <= 1
+            or y <= 1
+            or x + cw >= w - 1
+            or y + ch >= h - 1
+        )
+
+        elongation = max(cw, ch) / max(
+            1.0,
+            float(min(cw, ch))
+        )
+
+        # Typical crop/fruit-outline artifact: almost all pixels are in
+        # the boundary band and the shape does not penetrate into the apple.
+        if (
+            edge_fraction >= 0.78
+            and deep_fraction <= 0.10
+            and elongation >= 1.45
+        ):
+            continue
+
+        # If it actually touches the rectangular ROI edge, be a little
+        # stricter.  Real damage is still kept when enough of the component
+        # extends into the deep interior.
+        if (
+            touches_roi
+            and edge_fraction >= 0.65
+            and deep_fraction <= 0.18
+        ):
+            continue
+
+        cv.drawContours(
+            boundary_cleaned,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+    colour_mask = boundary_cleaned
+
+
+    # ======================================================
+    # 7. Wrinkle / Shrivel Detection
     # ======================================================
 
     (
@@ -1328,75 +2737,31 @@ def detect_apple_defect(roi):
 
 
     # ======================================================
-    # 4. Apple-specific boundary handling
+    # 8. Remove Natural Stem / Calyx
     # ======================================================
-    #
-    # Use different safe margins for colour defects and wrinkles.
-    #
-    # Colour defects:
-    #   use a stronger inner margin because leaf contact / fruit-edge
-    #   shadows are often dark/brown and can become false defects.
-    #
-    # Wrinkles:
-    #   use a smaller margin so genuine shrivel texture near the apple
-    #   edge (especially on an overripe apple) is still detected.
 
-    distance = cv.distanceTransform(
-        fruit_mask,
-        cv.DIST_L2,
-        5
-    )
-
-    h, w = fruit_mask.shape
-
-    colour_margin = max(
-        12,
-        int(min(h, w) * 0.12)
-    )
-
-    # Normal apples keep a safer edge margin.
-    # If the apple is globally very wrinkled/shrivelled, reduce the
-    # wrinkle-only margin so genuine wrinkles near the right/outer side
-    # are not removed.
-    if wrinkle_percentage >= 12.0:
-        wrinkle_margin = max(
-            4,
-            int(min(h, w) * 0.03)
-        )
-    else:
-        wrinkle_margin = max(
-            6,
-            int(min(h, w) * 0.05)
-        )
-
-    colour_safe_mask = np.zeros_like(
+    stem_calyx_mask = get_apple_stem_calyx_mask(
+        roi,
         fruit_mask
     )
-
-    wrinkle_safe_mask = np.zeros_like(
-        fruit_mask
-    )
-
-    colour_safe_mask[
-        distance >= colour_margin
-    ] = 255
-
-    wrinkle_safe_mask[
-        distance >= wrinkle_margin
-    ] = 255
 
     colour_mask = cv.bitwise_and(
         colour_mask,
-        colour_safe_mask
+        cv.bitwise_not(
+            stem_calyx_mask
+        )
     )
 
     wrinkle_mask = cv.bitwise_and(
         wrinkle_mask,
-        wrinkle_safe_mask
+        cv.bitwise_not(
+            stem_calyx_mask
+        )
     )
 
+
     # ======================================================
-    # 5. Combine Colour + Wrinkle Defects
+    # 9. Final Defect Mask
     # ======================================================
 
     defect_mask = cv.bitwise_or(
@@ -1411,157 +2776,10 @@ def detect_apple_defect(roi):
 
 
     # ======================================================
-    # 5. Clean Combined Mask
+    # 10. Defect Percentage
     # ======================================================
 
-    small_kernel = np.ones(
-        (3, 3),
-        np.uint8
-    )
-
-    defect_mask = cv.morphologyEx(
-        defect_mask,
-        cv.MORPH_CLOSE,
-        small_kernel,
-        iterations=1
-    )
-
-    # Keep final defect mask inside the apple
-    defect_mask = cv.bitwise_and(
-        defect_mask,
-        fruit_mask
-    )
-
-    # ======================================================
-    # 5c. REMOVE SMALL / THIN APPLE FALSE DEFECTS
-    # ======================================================
-    #
-    # Healthy green apples often contain:
-    # - stem / blossom marks
-    # - watermark / texture edges
-    # - small leaf-contact shadows
-    #
-    # These should not create red defect contours. Keep only
-    # meaningful interior defect regions.
-
-    fruit_pixels_for_clean = cv.countNonZero(
-        fruit_mask
-    )
-
-    # Healthy apples need strict cleanup because leaf contact,
-    # highlights and fruit edges can create false red contours.
-    #
-    # A strongly shrivelled apple is different: genuine wrinkle
-    # structures are numerous and often long/thin. In that case,
-    # keeping the same strict 0.5% area + 0.22 extent rule removes
-    # real wrinkles, especially on the right side.
-    strong_shrivel = (
-        wrinkle_percentage >= 12.0
-    )
-
-    normal_min_component_area = max(
-        100,
-        int(fruit_pixels_for_clean * 0.005)
-    )
-
-    wrinkle_min_component_area = max(
-        45,
-        int(fruit_pixels_for_clean * 0.0005)
-    )
-
-    cleaned_apple_mask = np.zeros_like(
-        defect_mask
-    )
-
-    apple_contours, _ = cv.findContours(
-        defect_mask,
-        cv.RETR_EXTERNAL,
-        cv.CHAIN_APPROX_SIMPLE
-    )
-
-    for contour in apple_contours:
-
-        area = cv.contourArea(
-            contour
-        )
-
-        x, y, cw, ch = cv.boundingRect(
-            contour
-        )
-
-        bbox_area = max(
-            1,
-            cw * ch
-        )
-
-        extent = (
-            area / bbox_area
-        )
-
-        # Check whether this combined component is genuinely supported
-        # by the wrinkle detector.
-        component_mask = np.zeros_like(
-            defect_mask
-        )
-
-        cv.drawContours(
-            component_mask,
-            [contour],
-            -1,
-            255,
-            cv.FILLED
-        )
-
-        wrinkle_overlap_pixels = cv.countNonZero(
-            cv.bitwise_and(
-                component_mask,
-                wrinkle_mask
-            )
-        )
-
-        component_pixels = max(
-            1,
-            cv.countNonZero(
-                component_mask
-            )
-        )
-
-        wrinkle_overlap_ratio = (
-            wrinkle_overlap_pixels
-            / component_pixels
-        )
-
-        if strong_shrivel and wrinkle_overlap_ratio >= 0.35:
-
-            # On a clearly shrivelled apple, preserve meaningful
-            # wrinkle-supported components even if they are thin.
-            if area < wrinkle_min_component_area:
-                continue
-
-        else:
-
-            # Normal / healthy apple behaviour remains strict.
-            if area < normal_min_component_area:
-                continue
-
-            if extent < 0.22:
-                continue
-
-        cv.drawContours(
-            cleaned_apple_mask,
-            [contour],
-            -1,
-            255,
-            cv.FILLED
-        )
-
-    defect_mask = cleaned_apple_mask
-
-    # ======================================================
-    # 6. Calculate Defect Percentage
-    # ======================================================
-
-    fruit_pixels = cv.countNonZero(
+    fruit_pixels_total = cv.countNonZero(
         fruit_mask
     )
 
@@ -1569,7 +2787,7 @@ def detect_apple_defect(roi):
         defect_mask
     )
 
-    if fruit_pixels == 0:
+    if fruit_pixels_total == 0:
 
         defect_percentage = 0.0
 
@@ -1577,16 +2795,17 @@ def detect_apple_defect(roi):
 
         defect_percentage = (
             defect_pixels
-            / fruit_pixels
-        ) * 100
+            / fruit_pixels_total
+        ) * 100.0
 
         defect_percentage = min(
             defect_percentage,
             100.0
         )
 
+
     # ======================================================
-    # 7. Draw Defect Contours
+    # 11. Draw Defect Contours
     # ======================================================
 
     output = roi.copy()
@@ -1597,17 +2816,53 @@ def detect_apple_defect(roi):
         cv.CHAIN_APPROX_SIMPLE
     )
 
+    minimum_draw_area = max(
+        12,
+        int(fruit_pixels_total * 0.00008)
+    )
+
+    # Draw into a temporary line mask, then suppress only display pixels
+    # that sit right on the fruit boundary.  This prevents a visually ugly
+    # red outline even when a valid defect happens to touch the edge.
+    contour_line_mask = np.zeros_like(
+        defect_mask
+    )
+
     for contour in contours:
 
-        if cv.contourArea(contour) > 25:
+        if cv.contourArea(contour) < minimum_draw_area:
+            continue
 
-            cv.drawContours(
-                output,
-                [contour],
-                -1,
-                (0, 0, 255),
-                2
-            )
+        cv.drawContours(
+            contour_line_mask,
+            [contour],
+            -1,
+            255,
+            2
+        )
+
+    display_margin = max(
+        3,
+        int(min(h, w) * 0.022)
+    )
+
+    display_safe_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    display_safe_mask[
+        distance >= display_margin
+    ] = 255
+
+    contour_line_mask = cv.bitwise_and(
+        contour_line_mask,
+        display_safe_mask
+    )
+
+    output[
+        contour_line_mask > 0
+    ] = (0, 0, 255)
+
 
     return (
         output,
@@ -5165,14 +6420,34 @@ def detect_orange_defect(roi):
 # Mango Defect Detection
 # ==========================================================
 
-def detect_mango_defect(roi):
+def detect_mango_defect(roi, fruit_mask_hint=None):
     """
-    Detects visible mango surface defects using a conservative
-    combination of local darkness, brown/black damage and
-    pale rough mould.
+    Detect visible mango surface defects while reducing false positives
+    from normal green / yellow / orange / red mango skin.
 
-    Small natural speckles/lenticels are removed as noise.
+    Handles, conservatively:
+    - brown / black rot
+    - dark bruising
+    - clustered black spots / anthracnose-like damage
+    - gray / white / pale mould
+    - olive / dark-green damaged patches
+    - dry / rough shrivelled regions
+
+    Natural colour transitions, red blush, small lenticels, stem contact,
+    outer shadows and tight YOLO crop boundaries are suppressed where
+    possible.
     """
+
+    if roi is None or roi.size == 0:
+        return (
+            roi.copy() if roi is not None else roi,
+            np.zeros((1, 1), dtype=np.uint8),
+            0.0
+        )
+
+    # ======================================================
+    # 1. PREPROCESSING
+    # ======================================================
 
     blurred = cv.GaussianBlur(
         roi,
@@ -5185,51 +6460,592 @@ def detect_mango_defect(roi):
         cv.COLOR_BGR2HSV
     )
 
-    fruit_mask = get_fruit_mask(
-        roi
+    gray = cv.cvtColor(
+        blurred,
+        cv.COLOR_BGR2GRAY
     )
 
-    if cv.countNonZero(fruit_mask) == 0:
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    h, w = value.shape
+
+    # ======================================================
+    # 2. MANGO-SPECIFIC FRUIT MASK
+    # ======================================================
+    # Mango peel may be green, yellow, orange or red. Build the
+    # fruit boundary mainly from chromatic peel pixels, then fill
+    # interior dark defects geometrically. This is safer than using
+    # one generic saturation/value rule for all fruit types.
+
+    chromatic_seed = np.zeros_like(value, dtype=np.uint8)
+
+    plausible_mango_hue = (
+        (hue <= 100)
+        | (hue >= 170)
+    )
+
+    chromatic_seed[
+        plausible_mango_hue
+        & (saturation >= 28)
+        & (value >= 28)
+    ] = 255
+
+    # Strong blue/cyan is unlikely to be mango peel.
+    blue_cyan = (
+        (hue >= 90)
+        & (hue <= 135)
+        & (saturation >= 55)
+    )
+
+    chromatic_seed[
+        blue_cyan
+    ] = 0
+
+    # Keep the literal ROI corners conservative. A mango is rounded,
+    # so rectangular corner blobs are usually background leakage.
+    chromatic_seed = suppress_bbox_corners(
+        chromatic_seed,
+        corner_ratio=0.08,
+        min_corner_px=4
+    )
+
+    chromatic_seed = cv.morphologyEx(
+        chromatic_seed,
+        cv.MORPH_CLOSE,
+        np.ones((7, 7), np.uint8),
+        iterations=2
+    )
+
+    chromatic_seed = cv.morphologyEx(
+        chromatic_seed,
+        cv.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    contours, _ = cv.findContours(
+        chromatic_seed,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE
+    )
+
+    fruit_mask = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    if not contours:
+        # Conservative fallback to the existing generic fruit mask.
+        fruit_mask = get_fruit_mask(roi)
+    else:
+        # Prefer a large component that is also near the ROI centre.
+        # This reduces the chance of selecting an isolated background
+        # blob when a YOLO crop has extra space around the mango.
+        cx0 = w / 2.0
+        cy0 = h / 2.0
+        diag = max(1.0, (w * w + h * h) ** 0.5)
+
+        def contour_score(c):
+            area = cv.contourArea(c)
+            m = cv.moments(c)
+
+            if m["m00"] != 0:
+                cx = m["m10"] / m["m00"]
+                cy = m["m01"] / m["m00"]
+            else:
+                x, y, cw, ch = cv.boundingRect(c)
+                cx = x + cw / 2.0
+                cy = y + ch / 2.0
+
+            centre_distance = (
+                ((cx - cx0) ** 2 + (cy - cy0) ** 2) ** 0.5
+                / diag
+            )
+
+            centre_weight = max(
+                0.25,
+                1.0 - centre_distance
+            )
+
+            return area * centre_weight
+
+        largest = max(
+            contours,
+            key=contour_score
+        )
+
+        raw_mask = np.zeros_like(
+            value,
+            dtype=np.uint8
+        )
+
+        cv.drawContours(
+            raw_mask,
+            [largest],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        # Mango is usually approximately convex / elliptical. The hull
+        # recovers internal brown/black/mould areas that were missing from
+        # the colour seed without changing any other fruit detector.
+        hull = cv.convexHull(largest)
+
+        hull_mask = np.zeros_like(
+            value,
+            dtype=np.uint8
+        )
+
+        cv.drawContours(
+            hull_mask,
+            [hull],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        # Restrict hull filling using a fitted ellipse where possible so
+        # a hand, table shadow or rectangular crop corner is less likely
+        # to become fruit.
+        if len(largest) >= 5:
+            ellipse = cv.fitEllipse(largest)
+            center, axes, angle = ellipse
+
+            expanded_ellipse = (
+                center,
+                (
+                    axes[0] * 1.04,
+                    axes[1] * 1.04
+                ),
+                angle
+            )
+
+            ellipse_mask = np.zeros_like(
+                value,
+                dtype=np.uint8
+            )
+
+            cv.ellipse(
+                ellipse_mask,
+                expanded_ellipse,
+                255,
+                cv.FILLED
+            )
+
+            hull_mask = cv.bitwise_and(
+                hull_mask,
+                ellipse_mask
+            )
+
+        # Preserve the measured fruit. Do NOT blindly union the whole
+        # convex hull: on a tight YOLO crop that can fill rectangular
+        # corner/background wedges and later make them look like dark rot.
+        #
+        # Only recover hull-added regions that are fully interior to the ROI.
+        hull_gap = cv.bitwise_and(
+            hull_mask,
+            cv.bitwise_not(raw_mask)
+        )
+
+        hull_gap = remove_border_components(
+            hull_gap,
+            margin=max(2, int(min(h, w) * 0.015)),
+            min_area=12
+        )
+
+        fruit_mask = cv.bitwise_or(
+            raw_mask,
+            hull_gap
+        )
+
+        # Keep the recovered mask inside the fitted mango geometry when
+        # ellipse fitting was available.
+        if len(largest) >= 5:
+            fruit_mask = cv.bitwise_and(
+                fruit_mask,
+                ellipse_mask
+            )
+
+    # ------------------------------------------------------
+    # Optional external segmentation hint
+    # ------------------------------------------------------
+    # The overall pipeline already segments each fruit before calling the
+    # defect module. For Mango only, accept that mask as a stronger boundary
+    # hint when it exactly matches this raw ROI. This prevents background,
+    # leaves, fingers and crop-corner wedges from being reintroduced by the
+    # mango-specific colour mask. The standalone detector still works because
+    # this argument is optional.
+    if (
+        isinstance(fruit_mask_hint, np.ndarray)
+        and fruit_mask_hint.shape[:2] == fruit_mask.shape[:2]
+    ):
+        hint = np.where(
+            fruit_mask_hint > 0,
+            255,
+            0
+        ).astype(np.uint8)
+
+        hint = cv.morphologyEx(
+            hint,
+            cv.MORPH_CLOSE,
+            np.ones((5, 5), np.uint8),
+            iterations=1
+        )
+
+        hint_contours, _ = cv.findContours(
+            hint,
+            cv.RETR_EXTERNAL,
+            cv.CHAIN_APPROX_SIMPLE
+        )
+
+        if hint_contours:
+            hint_largest = max(
+                hint_contours,
+                key=cv.contourArea
+            )
+
+            hint_clean = np.zeros_like(
+                hint
+            )
+
+            cv.drawContours(
+                hint_clean,
+                [hint_largest],
+                -1,
+                255,
+                cv.FILLED
+            )
+
+            hint_pixels = cv.countNonZero(
+                hint_clean
+            )
+
+            roi_pixels = h * w
+
+            # Ignore obviously collapsed/full-rectangle hints.
+            if (
+                hint_pixels >= roi_pixels * 0.18
+                and hint_pixels <= roi_pixels * 0.94
+            ):
+                fruit_mask = hint_clean
+
+    # ======================================================
+    # 2b. RECOVER LARGE GRAY / BLACK EDGE ROT
+    # ======================================================
+    # A badly rotten mango can lose almost all normal green/yellow/orange
+    # chroma on one side. In that case the colour-built fruit mask may stop
+    # at the healthy/rotten transition and incorrectly treat the dark rotten
+    # side as background. Recover ONLY large, low-saturation gray/black
+    # regions that are attached to the already-detected mango and penetrate
+    # well inside a mango-shaped ROI envelope.
+    #
+    # This is intentionally stricter than the normal defect threshold so
+    # dark leaves, hands and crop-corner shadows do not come back as fruit.
+
+    provisional_fruit_pixels = cv.countNonZero(
+        fruit_mask
+    )
+
+    severe_edge_recovery_mask = np.zeros_like(
+        fruit_mask
+    )
+
+    if provisional_fruit_pixels > 0:
+        provisional_values = value[
+            fruit_mask > 0
+        ]
+
+        provisional_median_v = float(
+            np.median(provisional_values)
+        )
+
+        recovery_v_limit = int(
+            max(
+                92,
+                min(155, provisional_median_v * 0.72)
+            )
+        )
+
+        gray_black_candidate = np.zeros_like(
+            value,
+            dtype=np.uint8
+        )
+
+        gray_black_candidate[
+            (value <= recovery_v_limit)
+            & (saturation <= 118)
+        ] = 255
+
+        gray_black_candidate = cv.morphologyEx(
+            gray_black_candidate,
+            cv.MORPH_CLOSE,
+            np.ones((5, 5), np.uint8),
+            iterations=2
+        )
+
+        gray_black_candidate = cv.morphologyEx(
+            gray_black_candidate,
+            cv.MORPH_OPEN,
+            np.ones((3, 3), np.uint8),
+            iterations=1
+        )
+
+        # Approximate a tight YOLO mango crop with a centred ellipse. This
+        # excludes the rectangular corners where background leakage is most
+        # common, while still allowing a genuine rotten side to reach the
+        # left/right crop boundary.
+        roi_mango_envelope = np.zeros_like(
+            fruit_mask
+        )
+
+        cv.ellipse(
+            roi_mango_envelope,
+            (w // 2, h // 2),
+            (
+                max(1, int(w * 0.52)),
+                max(1, int(h * 0.50))
+            ),
+            0,
+            0,
+            360,
+            255,
+            cv.FILLED
+        )
+
+        gray_black_candidate = cv.bitwise_and(
+            gray_black_candidate,
+            roi_mango_envelope
+        )
+
+        # Candidate must physically attach to the existing mango body.
+        attach_px = max(
+            5,
+            int(min(h, w) * 0.035)
+        )
+
+        attach_kernel_size = attach_px * 2 + 1
+
+        fruit_attachment_zone = cv.dilate(
+            fruit_mask,
+            np.ones(
+                (attach_kernel_size, attach_kernel_size),
+                np.uint8
+            ),
+            iterations=1
+        )
+
+        # Deep penetration inside the ROI ellipse distinguishes a real rotten
+        # side from a shallow black crescent sitting only on the crop edge.
+        padded_envelope = cv.copyMakeBorder(
+            roi_mango_envelope,
+            1, 1, 1, 1,
+            cv.BORDER_CONSTANT,
+            value=0
+        )
+
+        envelope_distance = cv.distanceTransform(
+            padded_envelope,
+            cv.DIST_L2,
+            5
+        )[1:h + 1, 1:w + 1]
+
+        envelope_deep_margin = max(
+            8,
+            int(min(h, w) * 0.08)
+        )
+
+        envelope_deep_zone = np.zeros_like(
+            fruit_mask
+        )
+
+        envelope_deep_zone[
+            envelope_distance >= envelope_deep_margin
+        ] = 255
+
+        recovery_contours, _ = cv.findContours(
+            gray_black_candidate,
+            cv.RETR_EXTERNAL,
+            cv.CHAIN_APPROX_SIMPLE
+        )
+
+        recovery_min_area = max(
+            100,
+            int(provisional_fruit_pixels * 0.008)
+        )
+
+        for recovery_contour in recovery_contours:
+            recovery_area = cv.contourArea(
+                recovery_contour
+            )
+
+            if recovery_area < recovery_min_area:
+                continue
+
+            recovery_component = np.zeros_like(
+                fruit_mask
+            )
+
+            cv.drawContours(
+                recovery_component,
+                [recovery_contour],
+                -1,
+                255,
+                cv.FILLED
+            )
+
+            recovery_pixels = max(
+                1,
+                cv.countNonZero(recovery_component)
+            )
+
+            attached_pixels = cv.countNonZero(
+                cv.bitwise_and(
+                    recovery_component,
+                    fruit_attachment_zone
+                )
+            )
+
+            deep_pixels = cv.countNonZero(
+                cv.bitwise_and(
+                    recovery_component,
+                    envelope_deep_zone
+                )
+            )
+
+            attached_ratio = (
+                attached_pixels / recovery_pixels
+            )
+
+            deep_ratio = (
+                deep_pixels / recovery_pixels
+            )
+
+            recovery_values = value[
+                recovery_component > 0
+            ]
+
+            recovery_saturation = saturation[
+                recovery_component > 0
+            ]
+
+            recovery_median_v = (
+                float(np.median(recovery_values))
+                if recovery_values.size
+                else 255.0
+            )
+
+            recovery_median_s = (
+                float(np.median(recovery_saturation))
+                if recovery_saturation.size
+                else 255.0
+            )
+
+            # Require a meaningful attachment, true inward penetration, and
+            # genuinely gray/black appearance.
+            if (
+                attached_ratio >= 0.025
+                and deep_ratio >= 0.12
+                and recovery_median_v <= 138
+                and recovery_median_s <= 105
+            ):
+                cv.drawContours(
+                    severe_edge_recovery_mask,
+                    [recovery_contour],
+                    -1,
+                    255,
+                    cv.FILLED
+                )
+
+        # A recovered severe-rotten side is part of the mango, so include it
+        # in the denominator as well as the defect mask later.
+        fruit_mask = cv.bitwise_or(
+            fruit_mask,
+            severe_edge_recovery_mask
+        )
+
+    fruit_pixels = cv.countNonZero(
+        fruit_mask
+    )
+
+    if fruit_pixels == 0:
         return (
             roi.copy(),
             np.zeros(roi.shape[:2], dtype=np.uint8),
             0.0
         )
 
-    # ------------------------------------------------------
-    # Safe inner fruit region
-    # ------------------------------------------------------
+    # ======================================================
+    # 3. PADDED DISTANCE TO FRUIT BOUNDARY
+    # ======================================================
+    # Padding is important when the mango touches a tight YOLO crop edge.
+    # Without it, distanceTransform may treat that edge incorrectly.
 
-    distance = cv.distanceTransform(
+    padded_fruit = cv.copyMakeBorder(
         fruit_mask,
+        1, 1, 1, 1,
+        cv.BORDER_CONSTANT,
+        value=0
+    )
+
+    padded_distance = cv.distanceTransform(
+        padded_fruit,
         cv.DIST_L2,
         5
     )
 
-    h, w = fruit_mask.shape
+    distance = padded_distance[
+        1:h + 1,
+        1:w + 1
+    ]
 
-    margin = max(
-        8,
-        int(min(h, w) * 0.03)
+    analysis_margin = max(
+        3,
+        int(min(h, w) * 0.018)
     )
 
-    inner_mask = np.zeros_like(
+    analysis_mask = np.zeros_like(
         fruit_mask
     )
 
-    inner_mask[
-        distance >= margin
+    analysis_mask[
+        distance >= analysis_margin
     ] = 255
 
-    # ------------------------------------------------------
-    # Local dark / bruised regions
-    # ------------------------------------------------------
+    # If the ROI is tiny, avoid eroding away nearly all the mango.
+    if cv.countNonZero(analysis_mask) < fruit_pixels * 0.45:
+        analysis_mask = fruit_mask.copy()
 
-    value = hsv[:, :, 2]
+    # ======================================================
+    # 4. ADAPTIVE BRIGHTNESS STATISTICS
+    # ======================================================
+
+    fruit_values = value[
+        fruit_mask > 0
+    ]
+
+    median_v = float(np.median(fruit_values))
+    q15_v = float(np.percentile(fruit_values, 15))
+
+    # Local brightness reference. Kernel scales with ROI size and stays odd.
+    local_k = max(
+        15,
+        int(min(h, w) * 0.18)
+    )
+
+    if local_k % 2 == 0:
+        local_k += 1
+
+    local_k = min(
+        local_k,
+        51
+    )
 
     local_brightness = cv.GaussianBlur(
         value,
-        (31, 31),
+        (local_k, local_k),
         0
     )
 
@@ -5238,132 +7054,243 @@ def detect_mango_defect(roi):
         value
     )
 
-    relative_dark = np.zeros_like(
+    # ======================================================
+    # 5. STRONG BLACK / VERY DARK DAMAGE
+    # ======================================================
+
+    black_limit = int(
+        max(
+            42,
+            min(75, q15_v - 18)
+        )
+    )
+
+    severe_dark_mask = np.zeros_like(
         value,
         dtype=np.uint8
     )
 
-    relative_dark[
-        (dark_difference > 22)
-        & (value < 190)
+    severe_dark_mask[
+        (value <= black_limit)
+        & (dark_difference >= 8)
     ] = 255
 
-    # ------------------------------------------------------
-    # Brown rot
-    # Mango can naturally contain yellow/red tones, so
-    # brown colour is accepted only when locally darker.
-    # ------------------------------------------------------
+    # Large rotten mango patches can be uniformly dark, so their centre may
+    # have little local contrast and the dark_difference test above only finds
+    # the rim. Recover globally-dark rotten tissue conservatively.
+    #
+    # Low-saturation gray/black rot is the safest cue. For colourful dark
+    # brown/black rot, require a brown/red hue as well. On generally dark
+    # green/unripe mangoes the thresholds tighten automatically.
+    global_dark_limit = int(
+        max(
+            72,
+            min(145, median_v * (0.68 if median_v >= 155 else 0.58))
+        )
+    )
+
+    desaturated_dark_rot = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    desaturated_dark_rot[
+        (value <= global_dark_limit)
+        & (saturation <= 115)
+    ] = 255
+
+    coloured_dark_limit = int(
+        max(
+            68,
+            min(135, median_v * (0.64 if median_v >= 155 else 0.54))
+        )
+    )
+
+    coloured_dark_rot = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    coloured_dark_rot[
+        (
+            (hue <= 24)
+            | (hue >= 170)
+        )
+        & (value <= coloured_dark_limit)
+        & (saturation >= 35)
+    ] = 255
+
+    severe_dark_mask = cv.bitwise_or(
+        severe_dark_mask,
+        desaturated_dark_rot
+    )
+
+    severe_dark_mask = cv.bitwise_or(
+        severe_dark_mask,
+        coloured_dark_rot
+    )
+
+    severe_dark_mask = cv.bitwise_and(
+        severe_dark_mask,
+        fruit_mask
+    )
+
+    # Any region that passed the strict gray/black edge-rot recovery above is
+    # explicit severe-dark defect evidence even when its centre is uniformly
+    # dark and therefore has little local contrast.
+    severe_dark_mask = cv.bitwise_or(
+        severe_dark_mask,
+        severe_edge_recovery_mask
+    )
+
+    # ======================================================
+    # 6. BROWN / DARK BRUISE
+    # ======================================================
+    # Red/orange blush is healthy on many mango cultivars. Brown candidates
+    # therefore need either clearly low brightness or strong LOCAL darkness.
 
     brown_candidate = cv.inRange(
         hsv,
-        np.array([0, 55, 20]),
-        np.array([28, 255, 165])
+        np.array([0, 45, 18]),
+        np.array([30, 255, 170])
     )
 
-    brown_confirm = np.zeros_like(
+    brown_evidence = np.zeros_like(
         value,
         dtype=np.uint8
     )
 
-    brown_confirm[
-        dark_difference > 12
+    brown_evidence[
+        (
+            (dark_difference >= 24)
+            & (value <= 165)
+        )
+        | (
+            (dark_difference >= 14)
+            & (value <= 105)
+        )
     ] = 255
 
     brown_mask = cv.bitwise_and(
         brown_candidate,
-        brown_confirm
+        brown_evidence
     )
 
-    # ------------------------------------------------------
-    # Very dark / black damage
-    # ------------------------------------------------------
-
-    black_mask = cv.inRange(
-        hsv,
-        np.array([0, 0, 0]),
-        np.array([180, 255, 65])
-    )
-
-    # ------------------------------------------------------
-    # Dense black-spot / anthracnose-like clusters
-    # ------------------------------------------------------
-    #
-    # Mango peel can contain tiny natural lenticels, so single dots
-    # should not automatically count as defects. However, when many
-    # dark spots occur close together, they form a meaningful damaged
-    # region. Detect the local DENSITY of dark spots instead of
-    # accepting every individual dot.
-
-    dark_spot_seed = np.zeros_like(
+    # Relative dark bruise regardless of exact hue, but require a strong
+    # local contrast so normal red-to-yellow gradients are not counted.
+    bruise_mask = np.zeros_like(
         value,
         dtype=np.uint8
     )
 
-    dark_spot_seed[
-        (value < 145)
-        & (dark_difference > 10)
-    ] = 255
-
-    dark_spot_seed = cv.bitwise_and(
-        dark_spot_seed,
-        inner_mask
+    bruise_v_limit = int(
+        min(
+            175,
+            max(110, median_v * 0.82)
+        )
     )
 
-    # Estimate local dark-spot density.
-    density = cv.blur(
-        dark_spot_seed,
-        (31, 31)
+    bruise_mask[
+        (dark_difference >= 30)
+        & (value <= bruise_v_limit)
+    ] = 255
+
+    # ======================================================
+    # 7. OLIVE / DARK-GREEN DAMAGE
+    # ======================================================
+    # Healthy unripe mango can be green, so green colour by itself is never
+    # treated as a defect. It must also be unusually dark locally.
+
+    olive_candidate = cv.inRange(
+        hsv,
+        np.array([25, 35, 20]),
+        np.array([95, 255, 125])
+    )
+
+    olive_evidence = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    olive_evidence[
+        (dark_difference >= 22)
+        & (value <= 115)
+    ] = 255
+
+    olive_mask = cv.bitwise_and(
+        olive_candidate,
+        olive_evidence
+    )
+
+    # ======================================================
+    # 8. CLUSTERED BLACK SPOTS / ANTHRACNOSE-LIKE DAMAGE
+    # ======================================================
+    # Isolated mango lenticels are common and should be ignored. Dense dark
+    # spot groups are more meaningful, so evaluate local density.
+
+    spot_seed = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    spot_v_limit = int(
+        min(
+            115,
+            max(72, median_v * 0.62)
+        )
+    )
+
+    spot_seed[
+        (value <= spot_v_limit)
+        & (dark_difference >= 14)
+    ] = 255
+
+    spot_seed = cv.bitwise_and(
+        spot_seed,
+        analysis_mask
+    )
+
+    density_k = max(
+        15,
+        int(min(h, w) * 0.12)
+    )
+
+    if density_k % 2 == 0:
+        density_k += 1
+
+    density_k = min(
+        density_k,
+        35
+    )
+
+    spot_density = cv.blur(
+        spot_seed,
+        (density_k, density_k)
     )
 
     dense_spot_region = np.zeros_like(
-        dark_spot_seed
+        spot_seed
     )
 
-    # Roughly >= 8% dark pixels in the local neighbourhood.
     dense_spot_region[
-        density >= 20
+        spot_density >= 28
     ] = 255
 
-    dense_spot_region = cv.bitwise_and(
-        dense_spot_region,
-        inner_mask
-    )
-
-    # Join nearby dense spot groups into visible damaged patches.
     dense_spot_region = cv.morphologyEx(
         dense_spot_region,
         cv.MORPH_CLOSE,
-        np.ones((7, 7), np.uint8),
-        iterations=2
-    )
-
-    dense_spot_region = cv.morphologyEx(
-        dense_spot_region,
-        cv.MORPH_OPEN,
-        np.ones((3, 3), np.uint8),
+        np.ones((5, 5), np.uint8),
         iterations=1
     )
 
     dense_spot_region = cv.bitwise_and(
         dense_spot_region,
-        inner_mask
+        analysis_mask
     )
 
-    # ------------------------------------------------------
-    # Pale / gray mould
-    # Require rough texture so normal highlights are reduced.
-    # ------------------------------------------------------
-
-    pale_candidate = cv.inRange(
-        hsv,
-        np.array([0, 0, 70]),
-        np.array([180, 90, 235])
-    )
-
-    gray = cv.cvtColor(
-        blurred,
-        cv.COLOR_BGR2GRAY
-    )
+    # ======================================================
+    # 9. PALE / GRAY / WHITE MOULD + DRY ROUGH PEEL
+    # ======================================================
 
     laplacian = cv.Laplacian(
         gray,
@@ -5371,115 +7298,274 @@ def detect_mango_defect(roi):
         ksize=3
     )
 
-    texture = np.abs(
+    texture_strength = np.abs(
         laplacian
     )
 
-    texture = np.clip(
-        texture,
+    texture_strength = np.clip(
+        texture_strength,
         0,
         255
     ).astype(np.uint8)
 
-    _, texture_mask = cv.threshold(
-        texture,
+    _, strong_texture = cv.threshold(
+        texture_strength,
         18,
         255,
         cv.THRESH_BINARY
     )
 
-    texture_mask = cv.dilate(
-        texture_mask,
-        np.ones((3, 3), np.uint8),
-        iterations=1
+    # Use local texture density rather than a single edge pixel.
+    texture_density = cv.blur(
+        strong_texture,
+        (11, 11)
     )
+
+    rough_region = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    rough_region[
+        texture_density >= 24
+    ] = 255
+
+    # Mould should usually be desaturated RELATIVE to nearby peel, not
+    # merely a naturally pale green/yellow patch. Use local saturation
+    # loss + rough texture to distinguish the two.
+    local_saturation = cv.GaussianBlur(
+        saturation,
+        (local_k, local_k),
+        0
+    )
+
+    saturation_drop = cv.subtract(
+        local_saturation,
+        saturation
+    )
+
+    pale_candidate = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    pale_candidate[
+        (
+            (saturation <= 70)
+            & (value >= 55)
+            & (value <= 235)
+        )
+        | (
+            (saturation <= 105)
+            & (saturation_drop >= 20)
+            & (value >= 55)
+            & (value <= 225)
+        )
+    ] = 255
+
+    mould_texture = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    mould_texture[
+        texture_density >= 32
+    ] = 255
 
     mold_mask = cv.bitwise_and(
         pale_candidate,
-        texture_mask
+        mould_texture
     )
 
-    # ------------------------------------------------------
-    # Combine all defect candidates
-    # ------------------------------------------------------
-
-    defect_mask = cv.bitwise_or(
-        relative_dark,
-        brown_mask
+    # Fruit/background contrast creates very strong texture right on the
+    # mango outline. Do not let that outer edge masquerade as mould.
+    # Genuine mould that reaches the boundary is still retained when the
+    # patch also extends into this deeper interior region.
+    mould_margin = max(
+        7,
+        int(min(h, w) * 0.09)
     )
 
-    defect_mask = cv.bitwise_or(
-        defect_mask,
-        black_mask
+    mould_inner_mask = np.zeros_like(
+        fruit_mask
     )
 
-    defect_mask = cv.bitwise_or(
-        defect_mask,
+    mould_inner_mask[
+        distance >= mould_margin
+    ] = 255
+
+    mold_mask = cv.bitwise_and(
+        mold_mask,
+        mould_inner_mask
+    )
+
+    # Dry/shrivelled peel tends to become both rough and less saturated.
+    # Requiring desaturation avoids flagging normal colourful red/yellow
+    # mango gradients as dry defects.
+    dry_mask = np.zeros_like(
+        value,
+        dtype=np.uint8
+    )
+
+    dry_mask[
+        (texture_density >= 50)
+        & (dark_difference >= 18)
+        & (value <= 170)
+        & (saturation <= 115)
+    ] = 255
+
+    dry_mask = cv.bitwise_and(
+        dry_mask,
+        mould_inner_mask
+    )
+
+    # ======================================================
+    # 10. COMBINE DEFECT EVIDENCE
+    # ======================================================
+
+    # Normal colour/texture candidates stay away from the fruit boundary,
+    # because shadows and crop edges are common false positives there.
+    interior_defect_mask = cv.bitwise_or(
+        brown_mask,
+        bruise_mask
+    )
+
+    interior_defect_mask = cv.bitwise_or(
+        interior_defect_mask,
+        olive_mask
+    )
+
+    interior_defect_mask = cv.bitwise_or(
+        interior_defect_mask,
         dense_spot_region
     )
 
-    defect_mask = cv.bitwise_or(
-        defect_mask,
+    interior_defect_mask = cv.bitwise_or(
+        interior_defect_mask,
         mold_mask
+    )
+
+    interior_defect_mask = cv.bitwise_or(
+        interior_defect_mask,
+        dry_mask
+    )
+
+    interior_defect_mask = cv.bitwise_and(
+        interior_defect_mask,
+        analysis_mask
+    )
+
+    # Very dark evidence is allowed to reach the fruit boundary. This is
+    # important for real rot that starts at one side of a mango. The
+    # component-level filter below still rejects shallow edge-only shadows.
+    defect_mask = cv.bitwise_or(
+        interior_defect_mask,
+        severe_dark_mask
     )
 
     defect_mask = cv.bitwise_and(
         defect_mask,
-        inner_mask
+        fruit_mask
     )
 
-    # ------------------------------------------------------
-    # Morphological cleaning
-    # ------------------------------------------------------
-
-    kernel = np.ones(
-        (3, 3),
-        np.uint8
-    )
-
+    # Small morphology only. Aggressive closing can merge normal mango
+    # colour transitions into one huge false defect region.
     defect_mask = cv.morphologyEx(
         defect_mask,
         cv.MORPH_OPEN,
-        kernel,
+        np.ones((3, 3), np.uint8),
         iterations=1
     )
 
     defect_mask = cv.morphologyEx(
         defect_mask,
         cv.MORPH_CLOSE,
-        kernel,
-        iterations=2
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    # Normal candidates stay inside analysis_mask, but the explicitly
+    # recovered severe gray/black side is allowed to reach the true mango
+    # boundary. Without this OR-back step a valid edge rot gets clipped away
+    # immediately after it was recovered.
+    defect_mask = cv.bitwise_and(
+        defect_mask,
+        analysis_mask
+    )
+
+    defect_mask = cv.bitwise_or(
+        defect_mask,
+        severe_edge_recovery_mask
     )
 
     defect_mask = cv.bitwise_and(
         defect_mask,
-        inner_mask
-    )
-
-    defect_mask = remove_border_components(
-        defect_mask,
-        margin=6,
-        min_area=40,
-        border_overlap_ratio=0.6
-    )
-
-    # ------------------------------------------------------
-    # Remove tiny natural mango speckles / lenticels
-    # ------------------------------------------------------
-
-    fruit_pixels = cv.countNonZero(
         fruit_mask
     )
 
-    min_area = max(
-        50,
-        int(fruit_pixels * 0.002)
-    )
+    # ======================================================
+    # 11. COMPONENT-LEVEL FALSE-POSITIVE FILTERING
+    # ======================================================
+    # Reject:
+    # - tiny isolated lenticels
+    # - long thin components hugging only the mango edge
+    # - stem/contact-shadow style slivers
+    # Keep:
+    # - compact internal rot
+    # - dense black-spot groups
+    # - components that extend meaningfully into the fruit interior
 
     cleaned_mask = np.zeros_like(
         defect_mask
     )
 
+    # Only clustered black spots / mould get the very small-component
+    # allowance. A single tiny very-dark point is usually a normal mango
+    # lenticel or image noise, so severe darkness alone does not lower the
+    # minimum component area.
+    # Tiny standalone mould-like patches are too easy to confuse with normal
+    # mango lenticels/highlights. Only dense dark-spot evidence gets the
+    # reduced minimum-area allowance; mould still has to clear the normal
+    # component-size threshold.
+    small_component_evidence = dense_spot_region.copy()
+
+    edge_band = max(
+        4,
+        int(min(h, w) * 0.035)
+    )
+
+    deep_margin = max(
+        edge_band + 2,
+        int(min(h, w) * 0.07)
+    )
+
+    edge_zone = np.zeros_like(
+        fruit_mask
+    )
+
+    edge_zone[
+        (distance > 0)
+        & (distance < edge_band)
+    ] = 255
+
+    deep_zone = np.zeros_like(
+        fruit_mask
+    )
+
+    deep_zone[
+        distance >= deep_margin
+    ] = 255
+
+    normal_min_area = max(
+        18,
+        int(fruit_pixels * 0.0012)
+    )
+
+    strong_min_area = max(
+        8,
+        int(fruit_pixels * 0.00035)
+    )
+
     contours, _ = cv.findContours(
         defect_mask,
         cv.RETR_EXTERNAL,
@@ -5487,69 +7573,287 @@ def detect_mango_defect(roi):
     )
 
     for contour in contours:
+        area = cv.contourArea(contour)
 
-        if cv.contourArea(contour) >= min_area:
+        if area <= 0:
+            continue
 
-            cv.drawContours(
-                cleaned_mask,
-                [contour],
-                -1,
-                255,
-                cv.FILLED
+        component = np.zeros_like(
+            defect_mask
+        )
+
+        cv.drawContours(
+            component,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        component_pixels = max(
+            1,
+            cv.countNonZero(component)
+        )
+
+        small_evidence_pixels = cv.countNonZero(
+            cv.bitwise_and(
+                component,
+                small_component_evidence
+            )
+        )
+
+        small_evidence_ratio = (
+            small_evidence_pixels
+            / component_pixels
+        )
+
+        min_area = (
+            strong_min_area
+            if small_evidence_ratio >= 0.18
+            else normal_min_area
+        )
+
+        if area < min_area:
+            continue
+
+        edge_pixels = cv.countNonZero(
+            cv.bitwise_and(
+                component,
+                edge_zone
+            )
+        )
+
+        deep_pixels = cv.countNonZero(
+            cv.bitwise_and(
+                component,
+                deep_zone
+            )
+        )
+
+        edge_ratio = (
+            edge_pixels
+            / component_pixels
+        )
+
+        deep_ratio = (
+            deep_pixels
+            / component_pixels
+        )
+
+        recovery_overlap_pixels = cv.countNonZero(
+            cv.bitwise_and(
+                component,
+                severe_edge_recovery_mask
+            )
+        )
+
+        recovery_overlap_ratio = (
+            recovery_overlap_pixels / component_pixels
+        )
+
+        confirmed_severe_edge_rot = (
+            recovery_overlap_ratio >= 0.20
+        )
+
+        x, y, cw, ch = cv.boundingRect(
+            contour
+        )
+
+        short_side = max(
+            1,
+            min(cw, ch)
+        )
+
+        long_side = max(
+            cw,
+            ch
+        )
+
+        elongation = (
+            long_side
+            / short_side
+        )
+
+        bbox_area = max(
+            1,
+            cw * ch
+        )
+
+        extent = (
+            area
+            / bbox_area
+        )
+
+        # Boundary-only regions are unreliable because normal mango
+        # shading, stem contact and the YOLO crop edge can all become dark.
+        # A genuine edge defect is kept when it extends meaningfully into
+        # the fruit interior; a shallow edge-only component is rejected.
+        if (
+            edge_ratio >= 0.55
+            and deep_ratio < 0.18
+            and not confirmed_severe_edge_rot
+        ):
+            continue
+
+        # Additional protection for compact edge blobs that are not long
+        # enough to trigger the rule above. This mainly removes small dark
+        # corner/shadow patches while preserving larger defects that reach
+        # deeper into the mango.
+        boundary_blob_limit = max(
+            60,
+            int(fruit_pixels * 0.012)
+        )
+
+        if (
+            edge_ratio >= 0.35
+            and deep_ratio < 0.10
+            and area < boundary_blob_limit
+            and not confirmed_severe_edge_rot
+        ):
+            continue
+
+        # --------------------------------------------------
+        # ROI-corner / crop-edge artifact suppression
+        # --------------------------------------------------
+        # The final defect mask has already been clipped a few pixels inside
+        # analysis_mask, so a crop-edge artifact often starts at x/y~=2-4
+        # instead of literal 0. Detect that geometry using a tolerant margin.
+        crop_edge_margin = max(
+            analysis_margin + 2,
+            int(min(h, w) * 0.025)
+        )
+
+        touches_left = x <= crop_edge_margin
+        touches_right = (x + cw) >= (w - crop_edge_margin)
+        touches_top = y <= crop_edge_margin
+        touches_bottom = (y + ch) >= (h - crop_edge_margin)
+
+        touches_corner = (
+            (touches_left or touches_right)
+            and (touches_top or touches_bottom)
+        )
+
+        touches_any_crop_edge = (
+            touches_left
+            or touches_right
+            or touches_top
+            or touches_bottom
+        )
+
+        component_area_ratio = (
+            component_pixels / max(1, fruit_pixels)
+        )
+
+        component_values = value[
+            component > 0
+        ]
+
+        component_median_v = (
+            float(np.median(component_values))
+            if component_values.size
+            else 255.0
+        )
+
+        # Small/medium components occupying a rectangular ROI corner are
+        # overwhelmingly likely to be background, leaf or contact-shadow
+        # leakage. Preserve only a genuinely very-dark patch that also reaches
+        # well into the mango body (real black rot can start at the edge).
+        if touches_corner and component_area_ratio < 0.12:
+            very_dark_deep_rot = (
+                component_median_v <= 62
+                and deep_ratio >= 0.25
             )
 
-    defect_mask = cleaned_mask
+            if not (
+                very_dark_deep_rot
+                or confirmed_severe_edge_rot
+            ):
+                continue
 
-    # ------------------------------------------------------
-    # Calculate defect percentage
-    # ------------------------------------------------------
+        # Reject small single-edge slivers. Keep a genuinely black, inward-
+        # extending lesion so real edge rot is not thrown away.
+        if (
+            touches_any_crop_edge
+            and not touches_corner
+            and component_area_ratio < 0.035
+        ):
+            strong_edge_rot = (
+                component_median_v <= 58
+                and deep_ratio >= 0.14
+            )
+
+            if not (
+                strong_edge_rot
+                or confirmed_severe_edge_rot
+            ):
+                continue
+
+        # Long thin crop-edge bands are typical of leaf/background/shadow
+        # leakage rather than organic mango lesions.
+        if (
+            touches_any_crop_edge
+            and elongation >= 2.2
+            and extent < 0.62
+            and deep_ratio < 0.30
+            and not confirmed_severe_edge_rot
+        ):
+            continue
+
+        cv.drawContours(
+            cleaned_mask,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+    defect_mask = cv.bitwise_and(
+        cleaned_mask,
+        fruit_mask
+    )
+
+    # ======================================================
+    # 12. DEFECT PERCENTAGE
+    # ======================================================
 
     defect_pixels = cv.countNonZero(
         defect_mask
     )
 
-    if fruit_pixels == 0:
+    defect_percentage = (
+        (defect_pixels / fruit_pixels) * 100
+        if fruit_pixels > 0
+        else 0.0
+    )
 
-        defect_percentage = 0.0
+    defect_percentage = min(
+        defect_percentage,
+        100.0
+    )
 
-    else:
-
-        defect_percentage = (
-            defect_pixels
-            / fruit_pixels
-        ) * 100
-
-        defect_percentage = min(
-            defect_percentage,
-            100.0
-        )
-
-    # ------------------------------------------------------
-    # Draw defects
-    # ------------------------------------------------------
+    # ======================================================
+    # 13. DRAW DEFECT CONTOURS
+    # ======================================================
+    # Percentage uses the real cleaned mask.
     #
-    # DISPLAY-ONLY boundary cleanup:
-    # Draw contours from the real defect mask, then remove only the
-    # contour-line pixels that sit too close to the mango outer edge.
-    # This avoids a false red line at the top/outer fruit boundary.
-    # Defect percentage is NOT changed here.
+    # Normal mango defects still hide line pixels that sit directly on the
+    # outer fruit boundary. This prevents a tight crop, leaf shadow or normal
+    # peel edge from creating a false red outline around the whole mango.
+    #
+    # IMPORTANT exception: a component that overlaps the strict
+    # severe_edge_recovery_mask is confirmed large gray/black edge rot.
+    # For that case the OUTER boundary is part of the real defect and should
+    # be visible too. Draw that contour separately without the display-edge
+    # clipping. This changes VISUALISATION ONLY -- defect_mask and percentage
+    # are unchanged.
 
     output = roi.copy()
 
-    display_margin = max(
-        8,
-        int(min(h, w) * 0.035)
+    normal_line_mask = np.zeros_like(
+        defect_mask
     )
 
-    display_inner_mask = np.zeros_like(
-        fruit_mask
-    )
-
-    display_inner_mask[
-        distance >= display_margin
-    ] = 255
-
-    contour_line_mask = np.zeros_like(
+    severe_edge_line_mask = np.zeros_like(
         defect_mask
     )
 
@@ -5560,20 +7864,78 @@ def detect_mango_defect(roi):
     )
 
     for contour in contours:
+        if cv.contourArea(contour) < strong_min_area:
+            continue
 
-        if cv.contourArea(contour) >= min_area:
+        component = np.zeros_like(
+            defect_mask
+        )
 
+        cv.drawContours(
+            component,
+            [contour],
+            -1,
+            255,
+            cv.FILLED
+        )
+
+        component_pixels = max(
+            1,
+            cv.countNonZero(component)
+        )
+
+        recovery_pixels = cv.countNonZero(
+            cv.bitwise_and(
+                component,
+                severe_edge_recovery_mask
+            )
+        )
+
+        recovery_ratio = (
+            recovery_pixels / component_pixels
+        )
+
+        # Only confirmed severe edge rot is allowed to show its complete
+        # outer contour. Ordinary defects keep the safer clipped display.
+        if recovery_ratio >= 0.20:
             cv.drawContours(
-                contour_line_mask,
+                severe_edge_line_mask,
+                [contour],
+                -1,
+                255,
+                2
+            )
+        else:
+            cv.drawContours(
+                normal_line_mask,
                 [contour],
                 -1,
                 255,
                 2
             )
 
-    contour_line_mask = cv.bitwise_and(
-        contour_line_mask,
-        display_inner_mask
+    display_edge_margin = max(
+        2,
+        int(min(h, w) * 0.012)
+    )
+
+    display_safe = np.zeros_like(
+        fruit_mask
+    )
+
+    display_safe[
+        distance >= display_edge_margin
+    ] = 255
+
+    # Hide only NORMAL contour-line pixels close to the mango boundary.
+    normal_line_mask = cv.bitwise_and(
+        normal_line_mask,
+        display_safe
+    )
+
+    contour_line_mask = cv.bitwise_or(
+        normal_line_mask,
+        severe_edge_line_mask
     )
 
     output[
@@ -6007,7 +8369,8 @@ def detect_strawberry_defect(roi):
 
 def detect_defect(
     roi,
-    fruit_type
+    fruit_type,
+    fruit_mask_hint=None
 ):
 
     fruit_type = fruit_type.lower()
@@ -6037,7 +8400,8 @@ def detect_defect(
     elif fruit_type == "mango":
 
         return detect_mango_defect(
-            roi
+            roi,
+            fruit_mask_hint=fruit_mask_hint
         )
 
 
