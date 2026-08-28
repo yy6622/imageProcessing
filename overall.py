@@ -911,7 +911,18 @@ def _fuse_quality(species, colour_label, colour_conf, colour_probs, defect_label
     else:
         defect_confirms_defect = defect_pct is not None and defect_pct >= DEFECT_CONFIRMS_DEFECT_PCT
 
-    if colour_label == "Rotten" and not defect_confirms_defect:
+    # Checked against the real 300-image evaluate_overall.py run: this veto
+    # never once saved a genuinely-Fresh fruit in that run -- the few Fresh
+    # images where colour cried Rotten all had colour_conf well under 0.9
+    # (~0.66), so the confidence arbitration below already resolves those
+    # correctly on its own. But the veto was unconditionally discarding
+    # colour whenever colour was maximally confident (~1.0, an n_neighbors=1
+    # artifact) and defect simply found no defect *region* on a truly rotten
+    # Orange/Apple -- that alone accounted for most of the dataset's
+    # Rotten-mistaken-for-Fresh errors (Orange 15/20, Apple 9/20). Gating the
+    # veto on colour_conf keeps it protecting genuinely uncertain colour
+    # calls while letting confidence-based arbitration settle the rest.
+    if colour_label == "Rotten" and not defect_confirms_defect and colour_conf < 0.9:
         fallback_label, fallback_conf = _best_non_rotten(colour_probs, colour_label, colour_conf)
         pct_str = f"{defect_pct:.1f}%" if defect_pct is not None else "n/a"
         notes.append(f"colour KNN said Rotten but defect found nothing (defect%={pct_str}) -- downgraded to {fallback_label}")
@@ -1038,7 +1049,28 @@ def analyse_fruit(crop_bgr, yolo_label, yolo_conf, mask=None, contour=None, roug
     scaler, knn_model, classes = _load_color_model(species)
     colour_probs = {}
     if scaler is not None:
-        label, conf, colour_probs = color_knn_module.predict_ripeness_from_color(crop_bgr, scaler, knn_model, classes)
+        # Match the same downscale the colour KNN's training pipeline uses
+        # (color_knn_module.MAX_IMAGE_SIDE) before extracting colour
+        # features. crop_bgr here is the isolated crop at the uploaded
+        # photo's ORIGINAL resolution (this pipeline no longer resizes the
+        # whole photo down first). The colour module's texture/gradient
+        # features are absolute-scale, so without capping to the same
+        # working size training used, a large phone photo produces gradient
+        # values far outside anything the model was trained on and biases
+        # predictions toward Rotten. Scoped to this colour call only --
+        # does not affect raw_crop_bgr, which defect/stem detection below
+        # still receive unchanged.
+        colour_input = crop_bgr
+        _colour_h, _colour_w = colour_input.shape[:2]
+        _colour_max_side = getattr(color_knn_module, "MAX_IMAGE_SIDE", 500)
+        if max(_colour_h, _colour_w) > _colour_max_side:
+            _colour_scale = _colour_max_side / float(max(_colour_h, _colour_w))
+            colour_input = cv2.resize(
+                colour_input,
+                (max(1, int(_colour_w * _colour_scale)), max(1, int(_colour_h * _colour_scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        label, conf, colour_probs = color_knn_module.predict_ripeness_from_color(colour_input, scaler, knn_model, classes)
         result.colour_quality = label
         result.colour_confidence = conf
     else:
@@ -1218,6 +1250,38 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
     """
     original_bgr = original_bgr.copy()
 
+    # ImageProcessing_ASS's colorDetection.py resizes the WHOLE uploaded
+    # photo to a fixed 512x512 working resolution (its DEFAULT_IMAGE_SIZE,
+    # `original = cv2.resize(original, image_size)`) BEFORE any detection,
+    # segmentation or classification runs -- every crop_object/colour-KNN
+    # call there operates on that resized copy. This pipeline stopped doing
+    # that so YOLO/defect/measurement could work at the uploaded photo's
+    # native resolution (deliberate, kept as-is below). But
+    # segmentation_mask_and_contour's morphological kernels and the colour
+    # KNN models were both tuned/trained at that same ~512px scale, so for a
+    # photo landing near the KNN's decision boundary, segmenting at native
+    # resolution instead of 512x512 can be enough to flip which training
+    # sample ends up nearest (confirmed on a real case: the true feature
+    # vector was only ~17% closer to its nearest Rotten neighbour than to
+    # its nearest Fresh one -- a near-tie, not a clear-cut Rotten photo).
+    # This reference copy is used ONLY below to find each fruit's local
+    # contour and build the isolated crop fed to species CNN + colour KNN
+    # (the main YOLO-detection loop). YOLO detection itself, defect/
+    # ripeness, stem detection, physical-size measurement, and the
+    # classical-segmentation fallback loop all keep using original_bgr at
+    # its native resolution, unchanged.
+    _seg_h, _seg_w = original_bgr.shape[:2]
+    _seg_ref_bgr = cv2.resize(original_bgr, (512, 512))
+    _seg_scale_x = 512.0 / _seg_w
+    _seg_scale_y = 512.0 / _seg_h
+
+    def _to_seg_ref_box(bx0, by0, bx1, by1):
+        rx0 = max(0, min(511, int(round(bx0 * _seg_scale_x))))
+        ry0 = max(0, min(511, int(round(by0 * _seg_scale_y))))
+        rx1 = max(rx0 + 1, min(512, int(round(bx1 * _seg_scale_x))))
+        ry1 = max(ry0 + 1, min(512, int(round(by1 * _seg_scale_y))))
+        return rx0, ry0, rx1, ry1
+
     # Run the teammate's independent morphological/texture module ONCE per
     # photo (it does its own whole-image YOLO pass), so its per-object
     # species guess is available as the third species candidate below AND
@@ -1315,7 +1379,26 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
             # localisation identical to the standalone defect test.
             x0, y0, x1p, y1p = x1, y1, x2, y2
 
-            crop_for_seg = prep.preprocess_image(original_bgr[y0:y1p, x0:x1p], denoise_method="median", enhance_method="none")
+            # ASS's colorDetection.py (inspect_image_yolo) pads the YOLO box
+            # by 8% before running segmentation on it -- that margin is what
+            # lets estimate_background_chroma() (segmentation.py) sample real
+            # background from the crop's own border. This pipeline builds
+            # crop_for_seg from the raw, unpadded YOLO box instead (kept
+            # deliberately just above for the duplicate/tiny-box checks and
+            # to match test_defect.py's localisation) -- when the YOLO box is
+            # tight around the fruit, the crop's border is fruit, not
+            # background, and the chroma estimate it feeds into is wrong.
+            # Add the same 8% padding ASS uses, scoped ONLY to this
+            # segmentation crop; x0/y0/x1p/y1p themselves (and therefore
+            # raw_crop/defect_raw_crop/bbox_xyxy below) stay unpadded.
+            _seg_pad_x = int(round((x1p - x0) * 0.08))
+            _seg_pad_y = int(round((y1p - y0) * 0.08))
+            _seg_box_x0 = max(0, x0 - _seg_pad_x)
+            _seg_box_y0 = max(0, y0 - _seg_pad_y)
+            _seg_box_x1 = min(w_img, x1p + _seg_pad_x)
+            _seg_box_y1 = min(h_img, y1p + _seg_pad_y)
+            _rx0, _ry0, _rx1, _ry1 = _to_seg_ref_box(_seg_box_x0, _seg_box_y0, _seg_box_x1, _seg_box_y1)
+            crop_for_seg = prep.preprocess_image(_seg_ref_bgr[_ry0:_ry1, _rx0:_rx1], denoise_method="median", enhance_method="none")
             local_mask, local_contour = segmentation_mask_and_contour(crop_for_seg)
             used_fallback_rect = local_contour is None
             if used_fallback_rect:
@@ -1330,7 +1413,7 @@ def run_overall_pipeline(original_bgr, yolo_confidence=YOLO_CONF, yolo_iou=YOLO_
             # the original colorDetection.py's crop_object(isolate=True): without
             # this, two touching fruits in the same padded box bleed into each
             # other's crop and can flip the CNN's species guess.
-            crop = _isolate_and_crop(original_bgr, local_contour, x0, y0)
+            crop = _isolate_and_crop(_seg_ref_bgr, local_contour, _rx0, _ry0)
             raw_crop = original_bgr[y0:y1p, x0:x1p]
             if crop.size == 0:
                 crop = raw_crop

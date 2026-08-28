@@ -5,5 +5,6 @@
         "./defect",
         "./morphological",
         "./fruit_type"
-    ]
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

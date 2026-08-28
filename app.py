@@ -256,6 +256,17 @@ st.markdown(
       .st-key-upload_dropzone [data-testid="stFileUploaderDropzone"] button svg {
         fill:#fff !important;
       }
+      /* "Take Photo" trigger button -- same green pill as the Upload button
+         above it, so the two read as one matching pair. */
+      .st-key-camera_trigger { margin-top:.6rem; }
+      .st-key-camera_trigger button {
+        border:0 !important; border-radius:10px !important;
+        background:linear-gradient(180deg,#216d49,#155a3a) !important;
+        color:#fff !important; font-weight:700 !important;
+      }
+      .st-key-camera_trigger button:hover {
+        background:linear-gradient(180deg,#1c5f3f,#0f492f) !important;
+      }
       .fq-thumb-row { gap:14px; padding:1.15rem 0 .15rem; }
       .fq-thumb { border-radius:14px; border:3px solid #fff; box-shadow:0 4px 14px rgba(33,62,42,.15); }
       .fq-thumb-badge { width:25px; height:25px; top:6px; right:6px; border:2px solid white; background:#138448; font-size:.72rem; }
@@ -525,6 +536,22 @@ if st.session_state["view"] == "upload":
             "Select one or more images", type=["jpg", "jpeg", "png", "bmp"],
             accept_multiple_files=True, label_visibility="collapsed",
         )
+        uploaded_files = list(uploaded_files) if uploaded_files else []
+
+        if "fq_show_camera" not in st.session_state:
+            st.session_state["fq_show_camera"] = False
+
+        with st.container(key="camera_trigger"):
+            if st.button("📷  Take Photo", key="fq_camera_toggle"):
+                st.session_state["fq_show_camera"] = not st.session_state["fq_show_camera"]
+
+        if st.session_state["fq_show_camera"]:
+            camera_photo = st.camera_input(
+                "Take a photo", key="fq_camera_input", label_visibility="collapsed",
+            )
+            if camera_photo is not None:
+                uploaded_files.append(camera_photo)
+
         if uploaded_files:
             thumbs = "".join(bgr_to_thumb_html(read_upload_to_bgr(f), size=124) for f in uploaded_files)
             st.markdown(f'<div class="fq-thumb-row">{thumbs}</div>', unsafe_allow_html=True)
@@ -748,10 +775,14 @@ else:
             if fr.stem_crop is not None:
                 images.append((fr.stem_crop, "Stem detection"))
             if len(images) == 1:
-                st.image(bgr_to_rgb(images[0][0]), caption=images[0][1], width=200)
+                st.image(bgr_to_rgb(images[0][0]), caption=images[0][1], width="stretch")
             else:
                 for img_col, (img, caption) in zip(st.columns(len(images)), images):
-                    img_col.image(bgr_to_rgb(img), caption=caption, width=180)
+                    # "stretch" fits each thumbnail to its own sub-column instead of a
+                    # fixed pixel width -- a fixed width was wider than the actual
+                    # rendered column once 3 fruit-cards x up to 3 images each were on
+                    # screen, so thumbnails spilled outside their box into the next card.
+                    img_col.image(bgr_to_rgb(img), caption=caption, width="stretch")
 
             st.markdown(
                 f"**Species:** {fr.species} ({fr.species_confidence*100:.0f}%) "

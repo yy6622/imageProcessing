@@ -16,8 +16,37 @@ def _dbg(*args):
 SEGMENTATION_CHROMA_THRESHOLD = 15.0   # min LAB a/b distance from background to count as foreground
 SEGMENTATION_BORDER_FRAC = 0.04        # fraction of each edge sampled to estimate background color
 
+# These two were tuned by eye at the pipeline's old fixed working
+# resolution (whole photo resized to 512x512 before any cropping/
+# segmentation ran). They are fixed ABSOLUTE pixel sizes, so once the
+# pipeline stopped resizing photos down first and started segmenting at
+# the uploaded photo's native resolution (which can be several times
+# larger, e.g. a 3000px+ phone photo), a 9px/5px kernel became too small
+# relative to the fruit to properly close small chroma gaps (reflections,
+# water droplets, seed texture) -- the foreground mask fragmented into
+# scattered blobs and cv2.findContours' "largest contour" pick could end
+# up being a small fragment instead of the whole fruit (observed in
+# practice: an isolated crop collapsing to a tiny sliver on an otherwise
+# black background, and colour KNN misreading fresh fruit as Rotten
+# because its features were computed on that broken fragment).
+# Keeping these as "the tuned size at 512px" and scaling them by the
+# actual image's size below reproduces the exact old behaviour for any
+# caller still working at ~512px, and generalises correctly for callers
+# that now pass full-resolution images.
 SEGMENTATION_CLOSE_KSIZE = 9
 SEGMENTATION_OPEN_KSIZE = 5
+SEGMENTATION_KSIZE_REFERENCE_SIDE = 512.0  # the side length these two were tuned against
+
+
+def _scaled_kernel_size(image_shape, ksize_at_reference, reference_side=SEGMENTATION_KSIZE_REFERENCE_SIDE, min_ksize=3):
+    """Scale a kernel size tuned at `reference_side` px to this image's actual size, staying odd."""
+    h, w = image_shape[:2]
+    scale = min(h, w) / reference_side
+    size = int(round(ksize_at_reference * scale))
+    size = max(min_ksize, size)
+    if size % 2 == 0:
+        size += 1
+    return size
 
 
 # ======================================================
@@ -84,8 +113,10 @@ def _foreground_contours(
     if exclude_leaf_green:
         mask[_leaf_green_mask(image)] = 0
 
-    close_kernel = np.ones((SEGMENTATION_CLOSE_KSIZE, SEGMENTATION_CLOSE_KSIZE), np.uint8)
-    open_kernel = np.ones((SEGMENTATION_OPEN_KSIZE, SEGMENTATION_OPEN_KSIZE), np.uint8)
+    close_ksize = _scaled_kernel_size(image.shape, SEGMENTATION_CLOSE_KSIZE)
+    open_ksize = _scaled_kernel_size(image.shape, SEGMENTATION_OPEN_KSIZE)
+    close_kernel = np.ones((close_ksize, close_ksize), np.uint8)
+    open_kernel = np.ones((open_ksize, open_ksize), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
 
