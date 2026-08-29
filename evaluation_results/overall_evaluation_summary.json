@@ -1,0 +1,235 @@
+{
+  "n_requested": 4188,
+  "no_detection": 66,
+  "species_mismatch": 571,
+  "overall": {
+    "n": 4188,
+    "accuracy": 0.7643266475644699,
+    "balanced_accuracy": 0.7636835016835017,
+    "macro_f1": 0.8277492568544237,
+    "labels": [
+      "Fresh",
+      "Unripe",
+      "Rotten",
+      "NoDetection"
+    ],
+    "confusion_matrix": [
+      [
+        1271,
+        20,
+        35,
+        174
+      ],
+      [
+        69,
+        897,
+        45,
+        177
+      ],
+      [
+        172,
+        9,
+        1033,
+        286
+      ],
+      [
+        0,
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  "per_fruit": {
+    "Apple": {
+      "n": 856,
+      "accuracy": 0.8469626168224299,
+      "balanced_accuracy": 0.8420312500000001,
+      "macro_f1": 0.8546353747631333,
+      "labels": [
+        "Fresh",
+        "Unripe",
+        "Rotten",
+        "NoDetection"
+      ],
+      "confusion_matrix": [
+        [
+          293,
+          3,
+          4,
+          0
+        ],
+        [
+          21,
+          191,
+          24,
+          20
+        ],
+        [
+          54,
+          5,
+          241,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "Banana": {
+      "n": 900,
+      "accuracy": 0.8955555555555555,
+      "balanced_accuracy": 0.8955555555555557,
+      "macro_f1": 0.90078306582999,
+      "labels": [
+        "Fresh",
+        "Unripe",
+        "Rotten",
+        "NoDetection"
+      ],
+      "confusion_matrix": [
+        [
+          293,
+          1,
+          6,
+          0
+        ],
+        [
+          30,
+          256,
+          12,
+          2
+        ],
+        [
+          36,
+          0,
+          257,
+          7
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "Mango": {
+      "n": 900,
+      "accuracy": 0.6711111111111111,
+      "balanced_accuracy": 0.6711111111111111,
+      "macro_f1": 0.7627416309621059,
+      "labels": [
+        "Fresh",
+        "Unripe",
+        "Rotten",
+        "NoDetection"
+      ],
+      "confusion_matrix": [
+        [
+          206,
+          12,
+          10,
+          72
+        ],
+        [
+          5,
+          261,
+          4,
+          30
+        ],
+        [
+          21,
+          3,
+          137,
+          139
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "Orange": {
+      "n": 794,
+      "accuracy": 0.8387909319899244,
+      "balanced_accuracy": 0.8116380297823597,
+      "macro_f1": 0.8538773166253346,
+      "labels": [
+        "Fresh",
+        "Unripe",
+        "Rotten",
+        "NoDetection"
+      ],
+      "confusion_matrix": [
+        [
+          285,
+          4,
+          11,
+          0
+        ],
+        [
+          13,
+          118,
+          4,
+          59
+        ],
+        [
+          32,
+          0,
+          263,
+          5
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "Strawberry": {
+      "n": 738,
+      "accuracy": 0.5420054200542005,
+      "balanced_accuracy": 0.5370531400966184,
+      "macro_f1": 0.6772335482660531,
+      "labels": [
+        "Fresh",
+        "Unripe",
+        "Rotten",
+        "NoDetection"
+      ],
+      "confusion_matrix": [
+        [
+          194,
+          0,
+          4,
+          102
+        ],
+        [
+          0,
+          71,
+          1,
+          66
+        ],
+        [
+          29,
+          1,
+          135,
+          135
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    }
+  }
+}
